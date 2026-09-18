@@ -1,0 +1,1 @@
+- [Deriv WebSocket auth split](deriv-websocket-auth.md) — keep public tick streaming and token-authenticated account balance on separate sockets.

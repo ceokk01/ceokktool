@@ -1,0 +1,105 @@
+openapi: 3.1.0
+info:
+  # Do not change the title, if the title changes, the import paths will be broken
+  title: Api
+  version: 0.1.0
+  description: API specification
+servers:
+  - url: /api
+    description: Base API path
+tags:
+  - name: health
+    description: Health operations
+  - name: deriv
+    description: Deriv connection and market configuration
+paths:
+  /healthz:
+    get:
+      operationId: healthCheck
+      tags: [health]
+      summary: Health check
+      description: Returns server health status
+      responses:
+        "200":
+          description: Healthy
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/HealthStatus"
+  /deriv/config:
+    get:
+      operationId: getDerivConfig
+      tags: [deriv]
+      summary: Get Deriv connection configuration
+      description: Returns the public configuration needed to connect to Deriv without exposing private credentials.
+      responses:
+        "200":
+          description: Deriv connection configuration
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/DerivConfig"
+  /deriv/market-catalog:
+    get:
+      operationId: getDerivMarketCatalog
+      tags: [deriv]
+      summary: Get supported Deriv market catalog
+      description: Returns the market families and symbols supported by the analysis workspace.
+      responses:
+        "200":
+          description: Supported Deriv market catalog
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/MarketCatalog"
+components:
+  schemas:
+    HealthStatus:
+      type: object
+      properties:
+        status:
+          type: string
+      required:
+        - status
+    DerivConfig:
+      type: object
+      properties:
+        publicAppId:
+          type: string
+        oauthConfigured:
+          type: boolean
+        websocketUrl:
+          type: string
+        legacyWebsocketUrl:
+          type: string
+      required:
+        - publicAppId
+        - oauthConfigured
+        - websocketUrl
+        - legacyWebsocketUrl
+    MarketSymbol:
+      type: object
+      properties:
+        symbol:
+          type: string
+        displayName:
+          type: string
+        category:
+          type: string
+        pipSize:
+          type: integer
+      required:
+        - symbol
+        - displayName
+        - category
+        - pipSize
+    MarketCatalog:
+      type: object
+      properties:
+        symbols:
+          type: array
+          items:
+            $ref: "#/components/schemas/MarketSymbol"
+      required:
+        - symbols
+

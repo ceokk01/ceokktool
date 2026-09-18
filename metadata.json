@@ -1,0 +1,6 @@
+{
+  "name": "Deriv Market Analysis",
+  "description": "Market Mind Pro — Real-time Deriv market analysis tool for digit strategies, tick stream metrics, bot execution, and risk management.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
