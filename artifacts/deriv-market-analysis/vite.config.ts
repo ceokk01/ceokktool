@@ -39,71 +39,56 @@ const symbols = [
 ];
 
 function apiPlugin(): Plugin {
+  const handleApi = (req: any, res: any, next: any) => {
+    const url = req.url?.split('?')[0];
+    if (url === '/api/healthz') {
+      res.setHeader('Content-Type', 'application/json');
+      res.end(JSON.stringify({ status: 'ok' }));
+      return;
+    }
+    if (url === '/api/deriv/config') {
+      const publicAppId = process.env.DERIV_APP_ID ?? '34rsO15CuRvkoltHhbFgO';
+      res.setHeader('Content-Type', 'application/json');
+      res.end(
+        JSON.stringify({
+          publicAppId,
+          oauthConfigured: Boolean(
+            process.env.DERIV_OAUTH_CLIENT_ID &&
+              process.env.DERIV_OAUTH_REDIRECT_URI,
+          ),
+          websocketUrl: 'wss://api.derivws.com/trading/v1/options/ws/public',
+          legacyWebsocketUrl: `wss://ws.derivws.com/websockets/v3?app_id=${encodeURIComponent(publicAppId)}`,
+        }),
+      );
+      return;
+    }
+    if (url === '/api/deriv/oauth-url') {
+      const parsedUrl = new URL(req.url || '', 'http://localhost');
+      const appId = parsedUrl.searchParams.get('app_id') || process.env.DERIV_APP_ID || '34rsO15CuRvkoltHhbFgO';
+      res.setHeader('Content-Type', 'application/json');
+      res.end(
+        JSON.stringify({
+          url: `https://oauth.deriv.com/oauth2/authorize?app_id=${encodeURIComponent(appId)}&l=en`,
+          appId,
+        }),
+      );
+      return;
+    }
+    if (url === '/api/deriv/market-catalog') {
+      res.setHeader('Content-Type', 'application/json');
+      res.end(JSON.stringify({ symbols }));
+      return;
+    }
+    next();
+  };
+
   return {
     name: 'deriv-api-plugin',
     configureServer(server) {
-      server.middlewares.use((req, res, next) => {
-        const url = req.url?.split('?')[0];
-        if (url === '/api/healthz') {
-          res.setHeader('Content-Type', 'application/json');
-          res.end(JSON.stringify({ status: 'ok' }));
-          return;
-        }
-        if (url === '/api/deriv/config') {
-          const publicAppId = process.env.DERIV_APP_ID ?? '1089';
-          res.setHeader('Content-Type', 'application/json');
-          res.end(
-            JSON.stringify({
-              publicAppId,
-              oauthConfigured: Boolean(
-                process.env.DERIV_OAUTH_CLIENT_ID &&
-                  process.env.DERIV_OAUTH_REDIRECT_URI,
-              ),
-              websocketUrl: 'wss://api.derivws.com/trading/v1/options/ws/public',
-              legacyWebsocketUrl: `wss://ws.derivws.com/websockets/v3?app_id=${encodeURIComponent(publicAppId)}`,
-            }),
-          );
-          return;
-        }
-        if (url === '/api/deriv/market-catalog') {
-          res.setHeader('Content-Type', 'application/json');
-          res.end(JSON.stringify({ symbols }));
-          return;
-        }
-        next();
-      });
+      server.middlewares.use(handleApi);
     },
     configurePreviewServer(server) {
-      server.middlewares.use((req, res, next) => {
-        const url = req.url?.split('?')[0];
-        if (url === '/api/healthz') {
-          res.setHeader('Content-Type', 'application/json');
-          res.end(JSON.stringify({ status: 'ok' }));
-          return;
-        }
-        if (url === '/api/deriv/config') {
-          const publicAppId = process.env.DERIV_APP_ID ?? '1089';
-          res.setHeader('Content-Type', 'application/json');
-          res.end(
-            JSON.stringify({
-              publicAppId,
-              oauthConfigured: Boolean(
-                process.env.DERIV_OAUTH_CLIENT_ID &&
-                  process.env.DERIV_OAUTH_REDIRECT_URI,
-              ),
-              websocketUrl: 'wss://api.derivws.com/trading/v1/options/ws/public',
-              legacyWebsocketUrl: `wss://ws.derivws.com/websockets/v3?app_id=${encodeURIComponent(publicAppId)}`,
-            }),
-          );
-          return;
-        }
-        if (url === '/api/deriv/market-catalog') {
-          res.setHeader('Content-Type', 'application/json');
-          res.end(JSON.stringify({ symbols }));
-          return;
-        }
-        next();
-      });
+      server.middlewares.use(handleApi);
     },
   };
 }

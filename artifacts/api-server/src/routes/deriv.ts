@@ -20,7 +20,7 @@ const symbols = [
 ];
 
 router.get("/deriv/config", (_req, res) => {
-  const publicAppId = process.env.DERIV_APP_ID ?? "1089";
+  const publicAppId = process.env.DERIV_APP_ID ?? "34rsO15CuRvkoltHhbFgO";
   const data = GetDerivConfigResponse.parse({
     publicAppId,
     oauthConfigured: Boolean(

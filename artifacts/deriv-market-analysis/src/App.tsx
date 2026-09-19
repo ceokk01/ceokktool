@@ -12,7 +12,9 @@ import {
   ChevronDown,
   ChevronUp,
   Clock,
+  Copy,
   ExternalLink,
+  Globe,
   Info,
   KeyRound,
   Layers,
@@ -30,9 +32,27 @@ import {
   Target,
   Trash2,
   TrendingUp,
+  UserCheck,
+  Wallet,
   X,
   Zap,
 } from 'lucide-react';
+import {
+  DEFAULT_DERIV_APP_ID,
+  DerivAccountProfile,
+  DerivOAuthAccount,
+  buildDerivOAuthUrl,
+  clearDerivAuth,
+  getActiveAccountLoginId,
+  getStoredAccounts,
+  getStoredAppId,
+  getStoredToken,
+  parseDerivOAuthParams,
+  saveStoredAccounts,
+  saveStoredAppId,
+  saveStoredToken,
+  setActiveAccountLoginId,
+} from './lib/derivAuth';
 import {
   OVER_UNDER_STRATEGIES,
   StrategyId,
@@ -568,9 +588,22 @@ export function MarketMindApp() {
   const [isRealAccount, setIsRealAccount] = useState<boolean>(false);
   const [demoBalance, setDemoBalance] = useState<number>(1284.56);
   const [realAccount, setRealAccount] = useState<{ loginid: string; balance: number; currency: string } | null>(null);
-  const [token, setToken] = useState<string>(() => localStorage.getItem('mmp_deriv_token') || '');
+  const [virtualAccount, setVirtualAccount] = useState<{ loginid: string; balance: number; currency: string } | null>(null);
+  const [accountProfile, setAccountProfile] = useState<DerivAccountProfile | null>(null);
+  const [oauthAccounts, setOauthAccounts] = useState<DerivOAuthAccount[]>(() => getStoredAccounts());
+  const [activeAccountLogin, setActiveAccountLogin] = useState<string>(() => getActiveAccountLoginId());
+  const [token, setToken] = useState<string>(() => getStoredToken());
+  const [customAppId, setCustomAppId] = useState<string>(() => getStoredAppId());
   const [tokenModalOpen, setTokenModalOpen] = useState(false);
   const [tokenInput, setTokenInput] = useState(token);
+  const [isAuthorizing, setIsAuthorizing] = useState<boolean>(false);
+  const [authError, setAuthError] = useState<string | null>(null);
+  const [authToast, setAuthToast] = useState<string | null>(null);
+  const [showAppIdSettings, setShowAppIdSettings] = useState<boolean>(false);
+  const [copiedCallback, setCopiedCallback] = useState<boolean>(false);
+  const [manualTokenTab, setManualTokenTab] = useState<boolean>(false);
+
+  const effectiveAppId = (customAppId || config?.publicAppId || DEFAULT_DERIV_APP_ID).trim();
 
   // Deriv Live WebSocket & Ticks
   const [ticks, setTicks] = useState<Tick[]>(() => generateSeedTicks(ALL_MARKETS[4], 120));
@@ -683,6 +716,186 @@ export function MarketMindApp() {
     setPriceDiff(0);
   }, [activeMarket.symbol]);
 
+  // Listen for OAuth params in URL (redirect flow) & postMessage (popup flow)
+  useEffect(() => {
+    // 1. Check URL parameters if redirected back to this page
+    const search = window.location.search;
+    const hash = window.location.hash;
+    if (search.includes('token') || search.includes('acct') || hash.includes('token')) {
+      const parsed = parseDerivOAuthParams(search || hash);
+      if (parsed.length > 0) {
+        saveStoredAccounts(parsed);
+        setOauthAccounts(parsed);
+        const first = parsed[0];
+        setActiveAccountLogin(first.account);
+        setActiveAccountLoginId(first.account);
+        setToken(first.token);
+        saveStoredToken(first.token);
+        setTokenInput(first.token);
+        setIsRealAccount(!first.isVirtual);
+        window.history.replaceState({}, document.title, window.location.pathname);
+        setAuthToast(`Authorized successfully with Deriv account ${first.account}!`);
+      }
+    }
+
+    // 2. Listen for postMessage from popup OAuth window
+    const handleOAuthMessage = (event: MessageEvent) => {
+      if (event.data?.type === 'DERIV_OAUTH_SUCCESS' && Array.isArray(event.data.accounts) && event.data.accounts.length > 0) {
+        const accounts: DerivOAuthAccount[] = event.data.accounts;
+        saveStoredAccounts(accounts);
+        setOauthAccounts(accounts);
+        const first = accounts[0];
+        setActiveAccountLogin(first.account);
+        setActiveAccountLoginId(first.account);
+        setToken(first.token);
+        saveStoredToken(first.token);
+        setTokenInput(first.token);
+        setIsRealAccount(!first.isVirtual);
+        setTokenModalOpen(false);
+        setAuthToast(`Authorized successfully with Deriv account ${first.account}!`);
+      }
+    };
+
+    window.addEventListener('message', handleOAuthMessage);
+    return () => window.removeEventListener('message', handleOAuthMessage);
+  }, []);
+
+  // Auto-dismiss auth notifications
+  useEffect(() => {
+    if (authToast) {
+      const timer = setTimeout(() => setAuthToast(null), 4000);
+      return () => clearTimeout(timer);
+    }
+  }, [authToast]);
+
+  // Dedicated Deriv Account & Balance WebSocket
+  // Follows Deriv API authorize & balance specification:
+  // wss://ws.derivws.com/websockets/v3?app_id=${APP_ID}
+  // -> { authorize: token }
+  // -> { balance: 1, subscribe: 1 }
+  const accountSocketRef = useRef<WebSocket | null>(null);
+
+  useEffect(() => {
+    if (!token.trim()) {
+      setAccountProfile(null);
+      setRealAccount(null);
+      setVirtualAccount(null);
+      setIsAuthorizing(false);
+      return;
+    }
+
+    let ws: WebSocket | null = null;
+    let pingInterval: number | undefined;
+    let isCancelled = false;
+
+    setIsAuthorizing(true);
+    setAuthError(null);
+
+    const wsUrl = `wss://ws.derivws.com/websockets/v3?app_id=${encodeURIComponent(effectiveAppId)}`;
+
+    try {
+      ws = new WebSocket(wsUrl);
+      accountSocketRef.current = ws;
+
+      ws.onopen = () => {
+        if (isCancelled) return;
+        // Authorize with token
+        ws?.send(JSON.stringify({ authorize: token.trim() }));
+
+        // Deriv closes idle connections after ~2 minutes; keep-alive every 25s
+        pingInterval = window.setInterval(() => {
+          if (ws?.readyState === WebSocket.OPEN) {
+            ws.send(JSON.stringify({ ping: 1 }));
+          }
+        }, 25000);
+      };
+
+      ws.onmessage = (event) => {
+        if (isCancelled) return;
+        try {
+          const data = JSON.parse(event.data);
+
+          if (data.error) {
+            console.error(`Deriv Account Error [${data.error.code}]: ${data.error.message}`);
+            setAuthError(`[${data.error.code}]: ${data.error.message}`);
+            setIsAuthorizing(false);
+            return;
+          }
+
+          if (data.msg_type === 'authorize' || data.authorize) {
+            const auth = data.authorize;
+            const isVirtual = Boolean(auth.is_virtual);
+            const bal = Number(auth.balance ?? 0);
+            const cur = auth.currency || 'USD';
+
+            const profile: DerivAccountProfile = {
+              loginid: auth.loginid,
+              fullname: auth.fullname,
+              email: auth.email,
+              currency: cur,
+              balance: bal,
+              isVirtual,
+            };
+
+            setAccountProfile(profile);
+            setIsAuthorizing(false);
+            setAuthError(null);
+
+            if (isVirtual) {
+              setVirtualAccount({ loginid: auth.loginid, balance: bal, currency: cur });
+            } else {
+              setRealAccount({ loginid: auth.loginid, balance: bal, currency: cur });
+            }
+
+            // Subscribe to real-time balance stream
+            ws?.send(JSON.stringify({ balance: 1, subscribe: 1 }));
+          }
+
+          if (data.msg_type === 'balance' || data.balance) {
+            const b = data.balance;
+            const newBal = Number(b.balance);
+            const cur = b.currency || 'USD';
+
+            setAccountProfile((prev) => (prev ? { ...prev, balance: newBal, currency: cur } : null));
+
+            const isVirt = b.loginid?.startsWith('VR') || accountProfile?.isVirtual;
+            if (isVirt) {
+              setVirtualAccount((prev) => (prev ? { ...prev, balance: newBal, currency: cur } : { loginid: b.loginid || 'VRTC', balance: newBal, currency: cur }));
+            } else {
+              setRealAccount((prev) => (prev ? { ...prev, balance: newBal, currency: cur } : { loginid: b.loginid || 'Real', balance: newBal, currency: cur }));
+            }
+          }
+        } catch {
+          // ignore parsing error
+        }
+      };
+
+      ws.onerror = (err) => {
+        if (!isCancelled) {
+          console.error('Deriv account socket error:', err);
+          setIsAuthorizing(false);
+        }
+      };
+
+      ws.onclose = () => {
+        if (!isCancelled) {
+          setIsAuthorizing(false);
+        }
+      };
+    } catch (err: any) {
+      setAuthError(err?.message || 'Failed to connect to Deriv');
+      setIsAuthorizing(false);
+    }
+
+    return () => {
+      isCancelled = true;
+      if (pingInterval) clearInterval(pingInterval);
+      if (ws) {
+        ws.close();
+      }
+    };
+  }, [token, effectiveAppId]);
+
   // Connect to Deriv Public WebSocket
   useEffect(() => {
     let ws: WebSocket | null = null;
@@ -691,7 +904,7 @@ export function MarketMindApp() {
 
     setConnectionStatus('connecting');
 
-    const wsUrl = config?.legacyWebsocketUrl || `wss://ws.derivws.com/websockets/v3?app_id=${encodeURIComponent(config?.publicAppId || '1089')}`;
+    const wsUrl = config?.legacyWebsocketUrl || `wss://ws.derivws.com/websockets/v3?app_id=${encodeURIComponent(effectiveAppId)}`;
 
     try {
       ws = new WebSocket(wsUrl);
@@ -719,15 +932,6 @@ export function MarketMindApp() {
             subscribe: 1,
           })
         );
-
-        // Authorize if token is available
-        if (token.trim()) {
-          ws?.send(
-            JSON.stringify({
-              authorize: token.trim(),
-            })
-          );
-        }
 
         // Keep-alive ping
         keepAliveTimer = window.setInterval(() => {
@@ -787,22 +991,6 @@ export function MarketMindApp() {
             setIsWsLive(true);
             setLastTickTime(Date.now());
           }
-
-          // Handle authorization response
-          if (data.authorize) {
-            setRealAccount({
-              loginid: data.authorize.loginid,
-              balance: Number(data.authorize.balance),
-              currency: data.authorize.currency || 'USD',
-            });
-            // Subscribe to balance updates
-            ws?.send(JSON.stringify({ balance: 1, subscribe: 1 }));
-          }
-
-          // Handle balance response
-          if (data.balance) {
-            setRealAccount((prev) => (prev ? { ...prev, balance: Number(data.balance.balance) } : null));
-          }
         } catch {
           // ignore parsing noise
         }
@@ -829,7 +1017,7 @@ export function MarketMindApp() {
         ws.close();
       }
     };
-  }, [activeMarket.symbol, token, config?.legacyWebsocketUrl, config?.publicAppId]);
+  }, [activeMarket.symbol, effectiveAppId, config?.legacyWebsocketUrl]);
 
   // Resilient real-time live ticker engine (ensures live market updates continue seamlessly)
   useEffect(() => {
@@ -1176,11 +1364,11 @@ export function MarketMindApp() {
   // Current balance to display
   const currentBalance = isRealAccount
     ? (realAccount ? realAccount.balance : 0.0)
-    : demoBalance;
+    : (virtualAccount ? virtualAccount.balance : demoBalance);
 
   const currentCurrency = isRealAccount
     ? (realAccount?.currency || 'USD')
-    : 'USD';
+    : (virtualAccount?.currency || 'USD');
 
   // Strategy preset selector logic
   const applyStrategyPreset = (stratId: string) => {
@@ -1762,19 +1950,111 @@ export function MarketMindApp() {
     return () => clearInterval(interval);
   }, [bots, ticks, isRealAccount, runsStepper]);
 
-  // Handle Token Save
+  // Deriv OAuth & Account Actions
+  const handleOAuthLogin = (openDirect = false) => {
+    const authUrl = buildDerivOAuthUrl(effectiveAppId);
+    if (openDirect) {
+      window.location.href = authUrl;
+      return;
+    }
+
+    const width = 640;
+    const height = 720;
+    const left = window.screenX + (window.outerWidth - width) / 2;
+    const top = window.screenY + (window.outerHeight - height) / 2;
+
+    const popup = window.open(
+      authUrl,
+      'deriv_oauth_login',
+      `width=${width},height=${height},left=${left},top=${top},status=no,resizable=yes,scrollbars=yes`
+    );
+
+    if (!popup || popup.closed || typeof popup.closed === 'undefined') {
+      window.location.href = authUrl;
+    }
+  };
+
+  const handleSelectOAuthAccount = (acct: DerivOAuthAccount) => {
+    setActiveAccountLogin(acct.account);
+    setActiveAccountLoginId(acct.account);
+    setToken(acct.token);
+    setTokenInput(acct.token);
+    saveStoredToken(acct.token);
+    setIsRealAccount(!acct.isVirtual);
+  };
+
+  const handleToggleRealDemo = (targetReal: boolean) => {
+    if (targetReal) {
+      const realAcct = oauthAccounts.find((a) => !a.isVirtual);
+      if (realAcct && realAcct.token !== token) {
+        setActiveAccountLogin(realAcct.account);
+        setActiveAccountLoginId(realAcct.account);
+        setToken(realAcct.token);
+        setTokenInput(realAcct.token);
+        saveStoredToken(realAcct.token);
+      }
+      setIsRealAccount(true);
+      if (!token && !realAcct) {
+        setTokenModalOpen(true);
+      }
+    } else {
+      const virtAcct = oauthAccounts.find((a) => a.isVirtual);
+      if (virtAcct && virtAcct.token !== token) {
+        setActiveAccountLogin(virtAcct.account);
+        setActiveAccountLoginId(virtAcct.account);
+        setToken(virtAcct.token);
+        setTokenInput(virtAcct.token);
+        saveStoredToken(virtAcct.token);
+      }
+      setIsRealAccount(false);
+    }
+  };
+
+  const handleSaveAppId = (newAppId: string) => {
+    const trimmed = newAppId.trim();
+    setCustomAppId(trimmed);
+    saveStoredAppId(trimmed);
+    setAuthToast(`Deriv App ID set to ${trimmed}`);
+  };
+
   const handleSaveToken = () => {
-    localStorage.setItem('mmp_deriv_token', tokenInput.trim());
-    setToken(tokenInput.trim());
+    const clean = tokenInput.trim();
+    saveStoredToken(clean);
+    setToken(clean);
     setTokenModalOpen(false);
+    if (clean) {
+      setAuthToast('Deriv API token saved. Authorizing...');
+    }
   };
 
   const handleLogout = () => {
-    localStorage.removeItem('mmp_deriv_token');
+    clearDerivAuth();
     setToken('');
+    setTokenInput('');
+    setOauthAccounts([]);
+    setActiveAccountLogin('');
+    setAccountProfile(null);
     setRealAccount(null);
+    setVirtualAccount(null);
     setIsRealAccount(false);
+    setAuthError(null);
     setTokenModalOpen(false);
+    setAuthToast('Logged out of Deriv account.');
+  };
+
+  const handleRefreshBalance = () => {
+    if (accountSocketRef.current?.readyState === WebSocket.OPEN) {
+      accountSocketRef.current.send(JSON.stringify({ balance: 1 }));
+      setAuthToast('Requesting latest balance from Deriv...');
+    }
+  };
+
+  const handleCopyCallbackUrl = () => {
+    const origin = typeof window !== 'undefined' ? window.location.origin : '';
+    const cbUrl = `${origin}/callback`;
+    navigator.clipboard.writeText(cbUrl);
+    setCopiedCallback(true);
+    setTimeout(() => setCopiedCallback(false), 2500);
   };
 
   // Switch between tabs
@@ -1843,26 +2123,24 @@ export function MarketMindApp() {
               <button
                 className={isRealAccount ? 'is-active' : ''}
                 type="button"
-                onClick={() => {
-                  if (!token) {
-                    setTokenModalOpen(true);
-                  } else {
-                    setIsRealAccount(true);
-                  }
-                }}
+                onClick={() => handleToggleRealDemo(true)}
               >
                 Real
               </button>
               <button
                 className={!isRealAccount ? 'is-active' : ''}
                 type="button"
-                onClick={() => setIsRealAccount(false)}
+                onClick={() => handleToggleRealDemo(false)}
               >
                 Demo
               </button>
             </div>
             <div className="balance-figure">
-              <span className="balance-label">{isRealAccount ? (realAccount ? realAccount.loginid : 'Real Balance') : 'Demo Balance'}</span>
+              <span className="balance-label">
+                {isRealAccount
+                  ? (realAccount ? realAccount.loginid : 'Real Balance')
+                  : (virtualAccount ? virtualAccount.loginid : 'Demo Balance')}
+              </span>
               <span className="balance-amount">
                 <span className="cur">{currentCurrency}</span>
                 {currentBalance.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
@@ -1871,17 +2149,25 @@ export function MarketMindApp() {
           </div>
 
           <button
-            className="btn btn-primary"
+            className={`btn ${token && (realAccount || virtualAccount || accountProfile) ? 'btn-outline border-emerald-500/40 text-emerald-400 bg-emerald-950/20 hover:bg-emerald-900/30' : 'btn-primary bg-[#ff444f] hover:bg-[#eb3c46] border-none text-white'}`}
             type="button"
             onClick={() => setTokenModalOpen(true)}
           >
-            {token && realAccount ? (
+            {token && (realAccount || virtualAccount || accountProfile) ? (
               <span className="flex items-center gap-1.5">
-                <Check size={14} />
-                {realAccount.loginid}
+                <span className="h-2 w-2 rounded-full bg-emerald-400 animate-pulse"></span>
+                <span className="font-mono text-xs font-semibold">
+                  {accountProfile?.loginid || realAccount?.loginid || virtualAccount?.loginid}
+                </span>
+                <span className="text-[10px] opacity-75">
+                  ({isRealAccount ? 'Real' : 'Demo'})
+                </span>
               </span>
             ) : (
-              'Log in with Deriv'
+              <span className="flex items-center gap-1.5 font-medium">
+                <Zap size={14} className="text-white" />
+                Log in with Deriv
+              </span>
             )}
           </button>
         </div>
@@ -3885,91 +4171,339 @@ export function MarketMindApp() {
         </div>
       )}
 
-      {/* ============ DERIV LOGIN / TOKEN MODAL ============ */}
+      {/* ============ FLOATING AUTH TOAST ============ */}
+      {authToast && (
+        <div className="fixed bottom-6 right-6 z-50 flex items-center gap-2.5 rounded-xl border border-emerald-500/50 bg-[#0c121d]/95 px-4 py-3 text-xs text-emerald-300 shadow-2xl backdrop-blur-md animate-in fade-in slide-in-from-bottom-3 duration-200">
+          <CheckCircle2 size={16} className="text-emerald-400 shrink-0" />
+          <span className="font-medium">{authToast}</span>
+        </div>
+      )}
+
+      {/* ============ DERIV LOGIN / OAUTH / ACCOUNT MODAL ============ */}
       {tokenModalOpen && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/70 p-4 backdrop-blur-sm">
-          <div className="w-full max-w-md rounded-2xl border border-[var(--line)] bg-[var(--surface)] p-6 text-text shadow-2xl">
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/75 p-4 backdrop-blur-sm">
+          <div className="w-full max-w-lg rounded-2xl border border-[var(--line)] bg-[var(--surface)] p-6 text-text shadow-2xl max-h-[90vh] overflow-y-auto">
             <div className="mb-4 flex items-center justify-between">
-              <div className="flex items-center gap-2">
-                <KeyRound size={20} className="text-live" />
-                <h2 className="text-lg font-bold">Deriv Account Authorization</h2>
+              <div className="flex items-center gap-2.5">
+                <div className="flex h-9 w-9 items-center justify-center rounded-xl bg-red-500/15 border border-red-500/30 text-[#ff444f]">
+                  <Globe size={20} />
+                </div>
+                <div>
+                  <h2 className="text-base font-bold text-text">Deriv Account & Balance</h2>
+                  <p className="text-[11px] text-text-3">OAuth login and real-time account streaming</p>
+                </div>
               </div>
               <button
                 type="button"
-                className="rounded-lg p-1.5 text-text-3 hover:bg-[var(--surface-2)] hover:text-text"
+                className="rounded-lg p-1.5 text-text-3 hover:bg-[var(--surface-2)] hover:text-text transition-colors"
                 onClick={() => setTokenModalOpen(false)}
               >
                 <X size={18} />
               </button>
             </div>
 
-            <p className="mb-4 text-xs text-text-2 leading-relaxed">
-              Public market ticks stream freely. To link your real account balance and execute live contracts, paste your Deriv API Token below.
-            </p>
-
-            <div className="mb-4">
-              <label className="mb-2 block text-xs font-semibold text-text-3">API Token</label>
-              <input
-                type="password"
-                className="mmp-input font-mono"
-                placeholder="Paste your Deriv API Token"
-                value={tokenInput}
-                onChange={(e) => setTokenInput(e.target.value)}
-              />
-            </div>
-
-            {realAccount && (
-              <div className="mb-4 rounded-lg border border-[var(--line)] bg-[var(--surface-2)] p-3 text-xs">
-                <div className="flex justify-between text-text-3">
-                  <span>Logged in ID:</span>
-                  <span className="font-mono text-text font-bold">{realAccount.loginid}</span>
+            {/* Error Notification */}
+            {authError && (
+              <div className="mb-4 flex items-start gap-2.5 rounded-xl border border-rose-500/40 bg-rose-950/30 p-3 text-xs text-rose-300">
+                <AlertTriangle size={16} className="shrink-0 mt-0.5 text-rose-400" />
+                <div className="flex-1">
+                  <span className="font-semibold">Authentication Notice:</span> {authError}
                 </div>
-                <div className="mt-1 flex justify-between text-text-3">
-                  <span>Live Balance:</span>
-                  <span className="font-mono text-rise font-bold">
-                    {realAccount.currency} {realAccount.balance.toFixed(2)}
-                  </span>
-                </div>
+                <button
+                  type="button"
+                  className="text-rose-400 hover:text-rose-200"
+                  onClick={() => setAuthError(null)}
+                >
+                  <X size={14} />
+                </button>
               </div>
             )}
 
-            <div className="mb-5 flex items-start gap-2 rounded-lg bg-[var(--ink)] p-3 text-[11px] text-text-3">
-              <Lock size={14} className="shrink-0 mt-0.5 text-live" />
-              <span>
-                Tokens are stored locally in your browser and used only to authorize your WebSocket session directly with Deriv.
-              </span>
-            </div>
-
-            <div className="flex items-center justify-between gap-3">
-              {token ? (
-                <button
-                  type="button"
-                  className="btn btn-danger"
-                  onClick={handleLogout}
-                >
-                  <LogOut size={14} className="mr-1.5 inline" />
-                  Log out
-                </button>
-              ) : (
-                <div></div>
-              )}
-              <div className="flex gap-2">
-                <button
-                  type="button"
-                  className="btn btn-ghost"
-                  onClick={() => setTokenModalOpen(false)}
-                >
-                  Cancel
-                </button>
-                <button
-                  type="button"
-                  className="btn btn-primary"
-                  onClick={handleSaveToken}
-                >
-                  Save & Connect
-                </button>
+            {/* Connecting State */}
+            {isAuthorizing && (
+              <div className="mb-4 flex items-center gap-2 rounded-xl border border-amber-500/30 bg-amber-950/20 p-3 text-xs text-amber-300">
+                <RefreshCw size={14} className="animate-spin text-amber-400" />
+                <span>Authorizing with Deriv WebSocket server...</span>
               </div>
-            </div>
+            )}
+
+            {/* CONNECTED STATE */}
+            {(accountProfile || realAccount || virtualAccount) ? (
+              <div className="space-y-4">
+                {/* Active Account Card */}
+                <div className="rounded-xl border border-emerald-500/30 bg-emerald-950/15 p-4">
+                  <div className="flex items-center justify-between mb-3">
+                    <div className="flex items-center gap-2">
+                      <span className="h-2.5 w-2.5 rounded-full bg-emerald-400 animate-pulse"></span>
+                      <span className="font-mono text-sm font-bold text-emerald-400">
+                        {accountProfile?.loginid || realAccount?.loginid || virtualAccount?.loginid}
+                      </span>
+                    </div>
+                    <span className="rounded-md border border-emerald-500/40 bg-emerald-500/10 px-2 py-0.5 font-mono text-[11px] font-semibold text-emerald-300">
+                      {(accountProfile?.isVirtual ?? isRealAccount === false) ? 'Demo Account' : 'Real Account'}
+                    </span>
+                  </div>
+
+                  <div className="mb-3">
+                    <div className="text-[11px] text-text-3 uppercase tracking-wider font-semibold">Live Balance</div>
+                    <div className="mt-0.5 flex items-baseline gap-2">
+                      <span className="text-2xl font-mono font-black text-rise">
+                        {currentCurrency} {currentBalance.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
+                      </span>
+                      <button
+                        type="button"
+                        className="inline-flex items-center gap-1 text-[11px] text-text-3 hover:text-text underline"
+                        onClick={handleRefreshBalance}
+                      >
+                        <RefreshCw size={12} />
+                        Refresh
+                      </button>
+                    </div>
+                  </div>
+
+                  {(accountProfile?.fullname || accountProfile?.email) && (
+                    <div className="border-t border-emerald-500/20 pt-2.5 text-xs text-text-3 grid grid-cols-2 gap-2">
+                      {accountProfile?.fullname && (
+                        <div>
+                          <span className="block text-[10px] text-text-3 uppercase">Holder</span>
+                          <span className="font-medium text-text">{accountProfile.fullname}</span>
+                        </div>
+                      )}
+                      {accountProfile?.email && (
+                        <div>
+                          <span className="block text-[10px] text-text-3 uppercase">Email</span>
+                          <span className="font-medium text-text truncate block">{accountProfile.email}</span>
+                        </div>
+                      )}
+                    </div>
+                  )}
+                </div>
+
+                {/* Multiple Accounts from OAuth */}
+                {oauthAccounts.length > 1 && (
+                  <div>
+                    <div className="mb-2 text-xs font-semibold text-text-3">Switch Connected Account:</div>
+                    <div className="grid grid-cols-2 gap-2">
+                      {oauthAccounts.map((acct) => {
+                        const isCurrent = (accountProfile?.loginid || activeAccountLogin) === acct.account;
+                        return (
+                          <button
+                            key={acct.account}
+                            type="button"
+                            className={`rounded-xl border p-2.5 text-left text-xs transition-all ${
+                              isCurrent
+                                ? 'border-live bg-[var(--surface-2)] text-text font-bold'
+                                : 'border-[var(--line)] bg-[var(--surface-2)]/50 text-text-2 hover:border-[var(--line-2)] hover:text-text'
+                            }`}
+                            onClick={() => handleSelectOAuthAccount(acct)}
+                          >
+                            <div className="flex items-center justify-between mb-1">
+                              <span className="font-mono text-xs font-bold">{acct.account}</span>
+                              <span className="text-[10px] px-1.5 py-0.2 rounded bg-black/40 text-text-3">
+                                {acct.isVirtual ? 'Demo' : 'Real'}
+                              </span>
+                            </div>
+                            <span className="text-[11px] text-text-3">{acct.currency}</span>
+                          </button>
+                        );
+                      })}
+                    </div>
+                  </div>
+                )}
+
+                <div className="pt-2 flex items-center justify-between gap-3 border-t border-[var(--line)]">
+                  <button
+                    type="button"
+                    className="btn btn-danger text-xs"
+                    onClick={handleLogout}
+                  >
+                    <LogOut size={14} className="mr-1.5 inline" />
+                    Disconnect Account
+                  </button>
+
+                  <div className="flex items-center gap-2">
+                    <button
+                      type="button"
+                      className="btn btn-ghost text-xs"
+                      onClick={() => handleOAuthLogin(false)}
+                    >
+                      <Globe size={13} className="mr-1.5 inline text-[#ff444f]" />
+                      Re-login with OAuth
+                    </button>
+                    <button
+                      type="button"
+                      className="btn btn-primary text-xs"
+                      onClick={() => setTokenModalOpen(false)}
+                    >
+                      Done
+                    </button>
+                  </div>
+                </div>
+              </div>
+            ) : (
+              /* NOT CONNECTED: OAUTH LOGIN FIRST */
+              <div className="space-y-4">
+                <div className="rounded-xl border border-red-500/20 bg-gradient-to-br from-red-500/10 via-transparent to-transparent p-5 text-center">
+                  <div className="mx-auto mb-3 flex h-12 w-12 items-center justify-center rounded-2xl bg-[#ff444f]/20 border border-[#ff444f]/40 text-[#ff444f]">
+                    <Wallet size={24} />
+                  </div>
+                  <h3 className="text-sm font-bold text-text mb-1">One-Click Deriv OAuth</h3>
+                  <p className="text-xs text-text-2 mb-4 leading-relaxed max-w-sm mx-auto">
+                    Log in securely with your Deriv account. Your real/demo balances and account credentials will link automatically without manually creating or copying API tokens.
+                  </p>
+
+                  <button
+                    type="button"
+                    className="w-full py-3 px-4 rounded-xl bg-[#ff444f] hover:bg-[#eb3c46] text-white font-semibold flex items-center justify-center gap-2 text-sm shadow-lg shadow-red-500/25 transition-all transform active:scale-98"
+                    onClick={() => handleOAuthLogin(false)}
+                  >
+                    <Globe size={18} />
+                    Log in with Deriv (OAuth)
+                  </button>
+
+                  <div className="mt-2.5">
+                    <button
+                      type="button"
+                      className="text-[11px] text-text-3 hover:text-text transition-colors underline"
+                      onClick={() => handleOAuthLogin(true)}
+                    >
+                      Open login in this tab instead of popup
+                    </button>
+                  </div>
+                </div>
+
+                {/* Alternative: Manual API Token Toggle */}
+                <div className="border-t border-[var(--line)] pt-3">
+                  <button
+                    type="button"
+                    className="w-full flex items-center justify-between text-xs text-text-3 hover:text-text py-1"
+                    onClick={() => setManualTokenTab(!manualTokenTab)}
+                  >
+                    <span className="flex items-center gap-1.5 font-medium">
+                      <KeyRound size={14} className="text-live" />
+                      Or use Deriv API Token (Alternative)
+                    </span>
+                    {manualTokenTab ? <ChevronUp size={14} /> : <ChevronDown size={14} />}
+                  </button>
+
+                  {manualTokenTab && (
+                    <div className="mt-3 rounded-xl border border-[var(--line)] bg-[var(--surface-2)] p-3.5 space-y-3 animate-in fade-in duration-150">
+                      <div>
+                        <div className="flex items-center justify-between mb-1.5">
+                          <label className="text-xs font-semibold text-text-3">API Token</label>
+                          <a
+                            href="https://app.deriv.com/account/api-token"
+                            target="_blank"
+                            rel="noopener noreferrer"
+                            className="inline-flex items-center gap-1 text-[11px] text-live hover:underline"
+                          >
+                            Get token on Deriv
+                            <ExternalLink size={11} />
+                          </a>
+                        </div>
+                        <input
+                          type="password"
+                          className="mmp-input font-mono text-xs"
+                          placeholder="Paste token (e.g. a1-xxxxxxxxxxxx)"
+                          value={tokenInput}
+                          onChange={(e) => setTokenInput(e.target.value)}
+                        />
+                      </div>
+
+                      <button
+                        type="button"
+                        className="btn btn-primary w-full text-xs"
+                        onClick={handleSaveToken}
+                      >
+                        Authorize with Token
+                      </button>
+                    </div>
+                  )}
+                </div>
+
+                {/* App ID & Callback Settings Toggle */}
+                <div className="border-t border-[var(--line)] pt-2">
+                  <button
+                    type="button"
+                    className="w-full flex items-center justify-between text-[11px] text-text-3 hover:text-text py-1"
+                    onClick={() => setShowAppIdSettings(!showAppIdSettings)}
+                  >
+                    <span className="flex items-center gap-1.5">
+                      <Settings size={13} />
+                      Deriv App ID & Redirect URL
+                    </span>
+                    {showAppIdSettings ? <ChevronUp size={13} /> : <ChevronDown size={13} />}
+                  </button>
+
+                  {showAppIdSettings && (
+                    <div className="mt-2.5 rounded-xl border border-[var(--line)] bg-[var(--ink)] p-3 space-y-3 text-xs text-text-3">
+                      <div>
+                        <label className="block text-[11px] font-semibold text-text-3 mb-1">
+                          Active Deriv App ID
+                        </label>
+                        <div className="flex gap-2">
+                          <input
+                            type="text"
+                            className="mmp-input font-mono text-xs flex-1"
+                            value={customAppId}
+                            onChange={(e) => setCustomAppId(e.target.value)}
+                            placeholder="34rsO15CuRvkoltHhbFgO"
+                          />
+                          <button
+                            type="button"
+                            className="btn btn-outline text-xs px-3"
+                            onClick={() => handleSaveAppId(customAppId)}
+                          >
+                            Save
+                          </button>
+                        </div>
+                      </div>
+
+                      <div>
+                        <div className="flex items-center justify-between mb-1">
+                          <span className="text-[11px] font-semibold text-text-3">OAuth Redirect URL:</span>
+                          <button
+                            type="button"
+                            className="inline-flex items-center gap-1 text-[11px] text-live hover:underline"
+                            onClick={handleCopyCallbackUrl}
+                          >
+                            {copiedCallback ? (
+                              <span className="text-emerald-400 flex items-center gap-1">
+                                <Check size={11} /> Copied!
+                              </span>
+                            ) : (
+                              <span className="flex items-center gap-1">
+                                <Copy size={11} /> Copy URL
+                              </span>
+                            )}
+                          </button>
+                        </div>
+                        <div className="font-mono text-[11px] bg-black/50 p-2 rounded-lg break-all text-text select-all border border-white/5">
+                          {typeof window !== 'undefined' ? `${window.location.origin}/callback` : 'https://ais-dev-mlabvk4g66aah7l7fcc6ka-265441201801.europe-west1.run.app/callback'}
+                        </div>
+                        <p className="mt-1 text-[10px] text-text-3 leading-tight">
+                          If registering your custom App on <a href="https://api.deriv.com/dashboard/apps/" target="_blank" rel="noopener noreferrer" className="text-live hover:underline">api.deriv.com</a>, configure this Redirect URL.
+                        </p>
+                      </div>
+                    </div>
+                  )}
+                </div>
+
+                <div className="flex items-center justify-between pt-3 border-t border-[var(--line)]">
+                  <div className="flex items-center gap-1.5 text-[11px] text-text-3">
+                    <Lock size={12} className="text-emerald-400" />
+                    <span>WebSocket TLS encrypted</span>
+                  </div>
+                  <button
+                    type="button"
+                    className="btn btn-ghost text-xs"
+                    onClick={() => setTokenModalOpen(false)}
+                  >
+                    Close
+                  </button>
+                </div>
+              </div>
+            )}
           </div>
         </div>
       )}

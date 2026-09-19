@@ -1,0 +1,141 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Authorizing Deriv Account — Market Mind Pro</title>
+  <style>
+    body {
+      margin: 0;
+      padding: 0;
+      background-color: #0c121d;
+      color: #e2e8f0;
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      min-height: 100vh;
+    }
+    .card {
+      background: #151f2e;
+      border: 1px solid #28374d;
+      border-radius: 1rem;
+      padding: 2.5rem;
+      max-width: 440px;
+      width: 90%;
+      text-align: center;
+      box-shadow: 0 20px 25px -5px rgba(0, 0, 0, 0.5);
+    }
+    .spinner {
+      width: 44px;
+      height: 44px;
+      border: 3px solid rgba(255, 68, 79, 0.2);
+      border-top-color: #ff444f;
+      border-radius: 50%;
+      animation: spin 0.9s linear infinite;
+      margin: 0 auto 1.5rem;
+    }
+    @keyframes spin {
+      to { transform: rotate(360deg); }
+    }
+    h2 {
+      margin: 0 0 0.5rem;
+      font-size: 1.25rem;
+      color: #f8fafc;
+    }
+    p {
+      margin: 0 0 1rem;
+      font-size: 0.875rem;
+      color: #94a3b8;
+      line-height: 1.5;
+    }
+    .badge {
+      display: inline-block;
+      padding: 0.25rem 0.75rem;
+      background: rgba(34, 197, 94, 0.15);
+      border: 1px solid rgba(34, 197, 94, 0.4);
+      color: #4ade80;
+      border-radius: 9999px;
+      font-size: 0.75rem;
+      font-family: monospace;
+    }
+  </style>
+</head>
+<body>
+  <div class="card">
+    <div class="spinner"></div>
+    <h2>Authenticating with Deriv</h2>
+    <p>Linking your account and balance. This window will close automatically...</p>
+    <div id="status" class="badge">Processing tokens...</div>
+  </div>
+
+  <script>
+    (function () {
+      const search = window.location.search || window.location.hash;
+      const params = new URLSearchParams(search.startsWith('?') || search.startsWith('#') ? search.slice(1) : search);
+      const accounts = [];
+
+      let i = 1;
+      while (params.has('acct' + i) && params.has('token' + i)) {
+        const account = params.get('acct' + i).trim();
+        const token = params.get('token' + i).trim();
+        const currency = (params.get('cur' + i) || 'USD').trim();
+        const isVirtual = account.startsWith('VR') || account.toLowerCase().includes('virtual');
+        if (account && token) {
+          accounts.push({ account, token, currency, isVirtual });
+        }
+        i++;
+      }
+
+      if (accounts.length === 0 && params.has('token1')) {
+        accounts.push({
+          account: params.get('acct1') || 'Account',
+          token: params.get('token1'),
+          currency: params.get('cur1') || 'USD',
+          isVirtual: (params.get('acct1') || '').startsWith('VR'),
+        });
+      }
+
+      if (accounts.length > 0) {
+        try {
+          localStorage.setItem('mmp_deriv_accounts', JSON.stringify(accounts));
+          localStorage.setItem('mmp_deriv_token', accounts[0].token);
+          localStorage.setItem('mmp_deriv_selected_acct', accounts[0].account);
+        } catch (e) {
+          console.error(e);
+        }
+
+        const statusEl = document.getElementById('status');
+        if (statusEl) {
+          statusEl.textContent = 'Authorized (' + accounts.length + ' account' + (accounts.length > 1 ? 's' : '') + ')';
+        }
+      }
+
+      // Check if opened as popup
+      if (window.opener && window.opener !== window) {
+        try {
+          window.opener.postMessage(
+            {
+              type: 'DERIV_OAUTH_SUCCESS',
+              accounts: accounts,
+              token: accounts[0] ? accounts[0].token : '',
+            },
+            '*'
+          );
+          setTimeout(function () {
+            window.close();
+          }, 600);
+          return;
+        } catch (err) {
+          console.warn('Could not postMessage to opener:', err);
+        }
+      }
+
+      // If direct window redirect, return to app root
+      setTimeout(function () {
+        window.location.href = '/';
+      }, 700);
+    })();
+  </script>
+</body>
+</html>

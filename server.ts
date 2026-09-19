@@ -47,7 +47,7 @@ app.get("/api/healthz", (_req, res) => {
 
 // Deriv Config Route
 app.get("/api/deriv/config", (_req, res) => {
-  const publicAppId = process.env.DERIV_APP_ID ?? "1089";
+  const publicAppId = process.env.DERIV_APP_ID ?? "34rsO15CuRvkoltHhbFgO";
   res.json({
     publicAppId,
     oauthConfigured: Boolean(
@@ -56,6 +56,13 @@ app.get("/api/deriv/config", (_req, res) => {
     websocketUrl: "wss://api.derivws.com/trading/v1/options/ws/public",
     legacyWebsocketUrl: `wss://ws.derivws.com/websockets/v3?app_id=${encodeURIComponent(publicAppId)}`,
   });
+});
+
+// Deriv OAuth URL Route
+app.get("/api/deriv/oauth-url", (req, res) => {
+  const appId = (req.query.app_id as string) || process.env.DERIV_APP_ID || "34rsO15CuRvkoltHhbFgO";
+  const url = `https://oauth.deriv.com/oauth2/authorize?app_id=${encodeURIComponent(appId)}&l=en`;
+  res.json({ url, appId });
 });
 
 // Deriv Market Catalog Route
