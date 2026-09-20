@@ -1,4 +1,22 @@
+export const DEFAULT_DERIV_CLIENT_ID = '34rWXxXfzwQBe8SvHKyId';
 export const DEFAULT_DERIV_APP_ID = '34rsO15CuRvkoltHhbFgO';
+
+export interface DerivTradingAccount {
+  account_id?: string;
+  accountId?: string;
+  id?: string;
+  loginid?: string;
+  login_id?: string;
+  account_type?: string;
+  accountType?: string;
+  type?: string;
+  is_virtual?: boolean;
+  currency?: string;
+  balance?: number | string;
+  available_balance?: number | string;
+  amount?: number | string;
+  [key: string]: any;
+}
 
 export interface DerivOAuthAccount {
   account: string;
@@ -21,12 +39,160 @@ const STORAGE_KEYS = {
   ACCOUNTS: 'mmp_deriv_accounts',
   SELECTED_ACCOUNT: 'mmp_deriv_selected_acct',
   APP_ID: 'mmp_deriv_app_id',
+  CLIENT_ID: 'mmp_deriv_client_id',
 };
 
 /**
- * Parse Deriv OAuth redirect parameters.
- * Deriv returns accounts as query parameters:
- * ?acct1=CR123456&token1=a1-xxxxxx&cur1=USD&acct2=VRTC987654&token2=a1-yyyyyy&cur2=USD
+ * Standard account parsing helpers as defined in the Deriv integration specs
+ */
+export function getAccountId(account: DerivTradingAccount | any): string {
+  if (!account) return '';
+  return (
+    account.account_id ||
+    account.accountId ||
+    account.id ||
+    account.loginid ||
+    account.login_id ||
+    account.account ||
+    ''
+  );
+}
+
+export function getAccountLabel(account: DerivTradingAccount | any): string {
+  if (!account) return 'Demo';
+  return (
+    account.account_type ||
+    account.accountType ||
+    account.type ||
+    (account.is_virtual ? 'demo' : 'real')
+  );
+}
+
+export function isDemoAccount(account: DerivTradingAccount | any): boolean {
+  if (!account) return true;
+  const label = String(getAccountLabel(account)).toLowerCase();
+  const id = String(getAccountId(account) || '').toLowerCase();
+
+  return (
+    account.is_virtual === true ||
+    label.includes('demo') ||
+    label.includes('virtual') ||
+    id.startsWith('vrtc') ||
+    id.startsWith('vr')
+  );
+}
+
+export function getBalance(account: DerivTradingAccount | any): string | number {
+  if (!account) return '0.00';
+  const val =
+    account.balance ??
+    account.available_balance ??
+    account.amount ??
+    '0.00';
+  return typeof val === 'number' ? val.toFixed(2) : String(val);
+}
+
+export function getAccountCurrency(account: DerivTradingAccount | any): string {
+  return account?.currency || (isDemoAccount(account) ? 'USD' : 'USD');
+}
+
+/**
+ * Fetch accounts from the server-side Deriv Options API
+ */
+export async function fetchDerivAccounts(): Promise<{
+  authenticated: boolean;
+  accounts: DerivTradingAccount[];
+  error?: string;
+}> {
+  try {
+    const response = await fetch('/api/accounts');
+    if (response.status === 401) {
+      return { authenticated: false, accounts: [] };
+    }
+
+    const payload = await response.json();
+    if (!response.ok) {
+      return {
+        authenticated: false,
+        accounts: [],
+        error: payload.error || payload.message || 'Could not load accounts',
+      };
+    }
+
+    const rawAccounts = payload.data ?? payload.accounts ?? [];
+    const accounts: DerivTradingAccount[] = Array.isArray(rawAccounts)
+      ? rawAccounts
+      : rawAccounts.accounts || [];
+
+    return { authenticated: true, accounts };
+  } catch (err: any) {
+    return { authenticated: false, accounts: [], error: err?.message };
+  }
+}
+
+/**
+ * Request an OTP WebSocket connection URL for an authenticated account
+ */
+export async function requestAccountOtpUrl(accountId: string): Promise<{
+  url?: string;
+  error?: string;
+}> {
+  try {
+    const response = await fetch(`/api/accounts/${encodeURIComponent(accountId)}/otp`, {
+      method: 'POST',
+    });
+
+    const payload = await response.json();
+    if (!response.ok) {
+      return {
+        error: payload.error || payload.message || 'Failed to obtain WebSocket URL',
+      };
+    }
+
+    const websocketUrl = payload.data?.url || payload.url;
+    if (!websocketUrl) {
+      return {
+        error: 'Deriv did not return a WebSocket URL',
+      };
+    }
+
+    return { url: websocketUrl };
+  } catch (err: any) {
+    return { error: err?.message || 'Network error requesting OTP' };
+  }
+}
+
+/**
+ * Check server auth status
+ */
+export async function checkServerAuthStatus(): Promise<{
+  authenticated: boolean;
+  clientId?: string;
+  expiresAt?: number;
+}> {
+  try {
+    const res = await fetch('/api/auth/status');
+    if (!res.ok) return { authenticated: false };
+    return await res.json();
+  } catch {
+    return { authenticated: false };
+  }
+}
+
+/**
+ * Logout from server Deriv session
+ */
+export async function logoutServerAuth(): Promise<void> {
+  try {
+    await fetch('/api/auth/logout', { method: 'POST' });
+  } catch {
+    // Ignore network error on logout
+  }
+  clearDerivAuth();
+}
+
+/**
+ * Parse legacy Deriv OAuth redirect parameters (fallback support)
  */
 export function parseDerivOAuthParams(queryOrHash: string): DerivOAuthAccount[] {
   if (!queryOrHash) return [];
@@ -36,7 +202,6 @@ export function parseDerivOAuthParams(queryOrHash: string): DerivOAuthAccount[] 
   const params = new URLSearchParams(cleanStr);
   const accounts: DerivOAuthAccount[] = [];
 
-  // Parse sequential indexed accounts: acct1, token1, cur1, acct2...
   let i = 1;
   while (params.has(`acct${i}`) && params.has(`token${i}`)) {
     const account = params.get(`acct${i}`)!.trim();
@@ -49,7 +214,6 @@ export function parseDerivOAuthParams(queryOrHash: string): DerivOAuthAccount[] 
     i++;
   }
 
-  // Fallback check for single account formats
   if (accounts.length === 0 && params.has('token1')) {
     const token = params.get('token1')!.trim();
     const account = (params.get('acct1') || 'Account').trim();
@@ -76,15 +240,7 @@ export function parseDerivOAuthParams(queryOrHash: string): DerivOAuthAccount[] 
 }
 
 /**
- * Build Deriv OAuth login URL
- */
-export function buildDerivOAuthUrl(appId?: string): string {
-  const finalAppId = (appId || getStoredAppId() || DEFAULT_DERIV_APP_ID).trim();
-  return `https://oauth.deriv.com/oauth2/authorize?app_id=${encodeURIComponent(finalAppId)}&l=en`;
-}
-
-/**
- * Storage utilities for persistent session
+ * Storage utilities for client preferences
  */
 export function getStoredAppId(): string {
   try {
@@ -162,3 +318,4 @@ export function clearDerivAuth(): void {
     // Ignore storage issues
   }
 }
+
