@@ -2,5 +2,11 @@
   "version": 2,
   "buildCommand": "npm run build",
   "installCommand": "npm install --legacy-peer-deps",
-  "outputDirectory": "artifacts/deriv-market-analysis/dist/public"
+  "outputDirectory": "artifacts/deriv-market-analysis/dist/public",
+  "rewrites": [
+    {
+      "source": "/callback",
+      "destination": "/"
+    }
+  ]
 }

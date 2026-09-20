@@ -47,7 +47,9 @@ import {
   getStoredAccounts,
   getStoredAppId,
   getStoredToken,
-  parseDerivOAuthParams,
+  getOAuthState,
+  getCodeVerifier,
+  clearOAuthSession,
   saveStoredAccounts,
   saveStoredAppId,
   saveStoredToken,
@@ -78,13 +80,30 @@ export interface MarketItem {
   pipSize: number;
 }
 
+type ContractType =
+  | 'Over'
+  | 'Under'
+  | 'Even'
+  | 'Odd'
+  | 'Rise'
+  | 'Fall'
+  | 'Matches'
+  | 'Differs'
+  | 'Accumulators';
+
+type BotCategory =
+  | 'Over/Under Strategies'
+  | 'Deriv Strategies 2'
+  | 'Indicators'
+  | 'General';
+
 export interface Candle {
   open: number;
   high: number;
   low: number;
   close: number;
   epoch: number;
-  volume?: number;
+  volume: number;
 }
 
 export const MARKET_GROUPS: { group: string; items: MarketItem[] }[] = [
@@ -167,7 +186,7 @@ export interface BotConfig {
   targetDigit?: number;
   strategyId?: StrategyId;
   strategyName?: string;
-  category?: 'Over/Under Strategies' | 'Deriv Strategies 2' | 'Indicators' | 'General';
+  category?: BotCategory;
   entryRule?: string;
   exitRule?: string;
   recoveryRule?: string;
@@ -659,9 +678,9 @@ export function MarketMindApp() {
     market: string;
     contractType: ContractType;
     targetDigit?: number;
-    strategyId?: string;
+    strategyId?: StrategyId;
     strategyName?: string;
-    category?: string;
+    category?: BotCategory;
     entryRule?: string;
     exitRule?: string;
     recoveryRule?: string;
@@ -716,34 +735,90 @@ export function MarketMindApp() {
     setPriceDiff(0);
   }, [activeMarket.symbol]);
 
-  // Listen for OAuth params in URL (redirect flow) & postMessage (popup flow)
+  // Handle Deriv OAuth 2.0 callback (authorization code + PKCE)
   useEffect(() => {
-    // 1. Check URL parameters if redirected back to this page
-    const search = window.location.search;
-    const hash = window.location.hash;
-    if (search.includes('token') || search.includes('acct') || hash.includes('token')) {
-      const parsed = parseDerivOAuthParams(search || hash);
-      if (parsed.length > 0) {
-        saveStoredAccounts(parsed);
-        setOauthAccounts(parsed);
-        const first = parsed[0];
-        setActiveAccountLogin(first.account);
-        setActiveAccountLoginId(first.account);
-        setToken(first.token);
-        saveStoredToken(first.token);
-        setTokenInput(first.token);
-        setIsRealAccount(!first.isVirtual);
-        window.history.replaceState({}, document.title, window.location.pathname);
-        setAuthToast(`Authorized successfully with Deriv account ${first.account}!`);
-      }
+    const params = new URLSearchParams(window.location.search);
+    const code = params.get('code');
+    const returnedState = params.get('state');
+    const oauthError = params.get('error');
+    const oauthErrorDescription = params.get('error_description');
+
+    if (oauthError) {
+      console.error('Deriv OAuth error:', oauthError, oauthErrorDescription);
+      setAuthError(
+        oauthErrorDescription || `Deriv authorization failed: ${oauthError}`,
+      );
+      window.history.replaceState({}, document.title, window.location.pathname);
+      return;
     }
 
-    // 2. Listen for postMessage from popup OAuth window
-    const handleOAuthMessage = (event: MessageEvent) => {
-      if (event.data?.type === 'DERIV_OAUTH_SUCCESS' && Array.isArray(event.data.accounts) && event.data.accounts.length > 0) {
-        const accounts: DerivOAuthAccount[] = event.data.accounts;
+    if (!code) {
+      return;
+    }
+
+    const expectedState = getOAuthState();
+    const codeVerifier = getCodeVerifier();
+
+    if (!returnedState || !expectedState || returnedState !== expectedState) {
+      console.error('Deriv OAuth state validation failed.');
+      setAuthError('Deriv authorization could not be verified. Please try again.');
+      clearOAuthSession();
+      window.history.replaceState({}, document.title, window.location.pathname);
+      return;
+    }
+
+    if (!codeVerifier) {
+      console.error('Deriv OAuth PKCE verifier is missing.');
+      setAuthError('Deriv authorization session expired. Please try again.');
+      clearOAuthSession();
+      window.history.replaceState({}, document.title, window.location.pathname);
+      return;
+    }
+
+    let cancelled = false;
+
+    const exchangeCode = async () => {
+      setIsAuthorizing(true);
+      setAuthError(null);
+
+      try {
+        const response = await fetch('/api/deriv/oauth/token', {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+          },
+          body: JSON.stringify({
+            code,
+            state: returnedState,
+            codeVerifier,
+          }),
+        });
+
+        const data = await response.json().catch(() => ({}));
+
+        if (!response.ok) {
+          throw new Error(
+            data?.error_description ||
+              data?.error ||
+              `OAuth token exchange failed (${response.status})`,
+          );
+        }
+
+        const accounts = Array.isArray(data?.accounts)
+          ? (data.accounts as DerivOAuthAccount[])
+          : [];
+
+        if (accounts.length === 0) {
+          throw new Error('Deriv authorization succeeded but no accounts were returned.');
+        }
+
+        if (cancelled) {
+          return;
+        }
+
         saveStoredAccounts(accounts);
         setOauthAccounts(accounts);
+
         const first = accounts[0];
         setActiveAccountLogin(first.account);
         setActiveAccountLoginId(first.account);
@@ -752,12 +827,35 @@ export function MarketMindApp() {
         setTokenInput(first.token);
         setIsRealAccount(!first.isVirtual);
         setTokenModalOpen(false);
+
+        clearOAuthSession();
+        window.history.replaceState({}, document.title, window.location.pathname);
         setAuthToast(`Authorized successfully with Deriv account ${first.account}!`);
+      } catch (error) {
+        if (cancelled) {
+          return;
+        }
+
+        console.error('Deriv OAuth callback failed:', error);
+        setAuthError(
+          error instanceof Error
+            ? error.message
+            : 'Deriv authorization failed. Please try again.',
+        );
+        clearOAuthSession();
+        window.history.replaceState({}, document.title, window.location.pathname);
+      } finally {
+        if (!cancelled) {
+          setIsAuthorizing(false);
+        }
       }
     };
 
-    window.addEventListener('message', handleOAuthMessage);
-    return () => window.removeEventListener('message', handleOAuthMessage);
+    void exchangeCode();
+
+    return () => {
+      cancelled = true;
+    };
   }, []);
 
   // Auto-dismiss auth notifications
@@ -766,6 +864,7 @@ export function MarketMindApp() {
       const timer = setTimeout(() => setAuthToast(null), 4000);
       return () => clearTimeout(timer);
     }
+    return undefined;
   }, [authToast]);
 
   // Dedicated Deriv Account & Balance WebSocket
@@ -1204,7 +1303,7 @@ export function MarketMindApp() {
   const strategySignal = useMemo<StrategySignalResult>(() => {
     switch (selectedStrategyId) {
       case 'strategy-3':
-        return evaluateStrategy3(derivCandles, ticks, sampleTicks);
+        return evaluateStrategy3(derivCandles, ticks, digitSampleSize);
       case 'strategy-4':
         return evaluateStrategy4(derivCandles, ticks);
       case 'strategy-5':
@@ -1212,19 +1311,19 @@ export function MarketMindApp() {
       case 'strategy-6':
         return evaluateStrategy6(derivCandles, ticks);
       case 'over-1':
-        return evaluateOver1Strategy(ticks, sampleTicks);
+        return evaluateOver1Strategy(ticks, digitSampleSize);
       case 'over-2':
-        return evaluateOver2Strategy(ticks, sampleTicks);
+        return evaluateOver2Strategy(ticks, digitSampleSize);
       case 'under-8':
-        return evaluateUnder8Strategy(ticks, sampleTicks);
+        return evaluateUnder8Strategy(ticks, digitSampleSize);
       case 'under-7':
-        return evaluateUnder7Strategy(ticks, sampleTicks);
+        return evaluateUnder7Strategy(ticks, digitSampleSize);
       case 'cmv-pro':
-        return evaluateCMVPro(derivCandles, ticks, sampleTicks);
+        return evaluateCMVPro(derivCandles, ticks, digitSampleSize);
       case 'hit-run':
-        return evaluateHitAndRun(ticks, sampleTicks, hitAndRunTargetDigit);
+        return evaluateHitAndRun(ticks, digitSampleSize, hitAndRunTargetDigit);
       default:
-        return evaluateOver1Strategy(ticks, sampleTicks);
+        return evaluateOver1Strategy(ticks, digitSampleSize);
     }
   }, [selectedStrategyId, derivCandles, ticks, sampleTicks, hitAndRunTargetDigit]);
 
@@ -1244,7 +1343,9 @@ export function MarketMindApp() {
         targetDigit: strategySignal.predictionDigit,
         strategyId: strategySignal.strategyId,
         strategyName: strategySignal.strategyName,
+        category: (selectedStrategyId.startsWith('strategy-') ? 'Indicators' : 'Deriv Strategies 2') as BotCategory,
         entryRule: strategySignal.entryRule,
+        exitRule: strategySignal.exitRule,
         recoveryRule: strategySignal.recoveryRule,
         market: activeMarket.displayName,
         stake: strategySignal.strategyId === 'hit-run' ? '1.00' : '0.50',
@@ -1338,7 +1439,9 @@ export function MarketMindApp() {
       targetDigit: undefined as number | undefined,
       strategyId: undefined as StrategyId | undefined,
       strategyName: undefined as string | undefined,
+      category: 'General' as BotCategory,
       entryRule: undefined as string | undefined,
+      exitRule: 'Stop when the signal weakens or the recommended run target is reached',
       recoveryRule: undefined as string | undefined,
       market: activeMarket.displayName,
       stake: '0.50',
@@ -1468,7 +1571,7 @@ export function MarketMindApp() {
       id: bot.id,
       name: bot.name,
       market: bot.market,
-      contractType: bot.contractType,
+      contractType: bot.contractType as ContractType,
       targetDigit: bot.targetDigit,
       strategyId: bot.strategyId,
       strategyName: bot.strategyName,
@@ -1514,11 +1617,11 @@ export function MarketMindApp() {
       id: undefined,
       name: dynamicSignal.recommendedBot.name,
       market: activeMarket.displayName,
-      contractType: dynamicSignal.recommendedBot.contractType,
+      contractType: dynamicSignal.recommendedBot.contractType as ContractType,
       targetDigit: dynamicSignal.recommendedBot.targetDigit,
-      strategyId: dynamicSignal.recommendedBot.strategyId,
+      strategyId: dynamicSignal.recommendedBot.strategyId as StrategyId | undefined,
       strategyName: dynamicSignal.recommendedBot.strategyName,
-      category: dynamicSignal.recommendedBot.category || (selectedStrategyId.startsWith('strategy-') ? 'Indicators' : 'Deriv Strategies 2'),
+      category: (dynamicSignal.recommendedBot.category || (selectedStrategyId.startsWith('strategy-') ? 'Indicators' : 'Deriv Strategies 2')) as BotCategory,
       entryRule: dynamicSignal.recommendedBot.entryRule,
       exitRule: dynamicSignal.recommendedBot.exitRule,
       recoveryRule: dynamicSignal.recommendedBot.recoveryRule,
@@ -1589,16 +1692,16 @@ export function MarketMindApp() {
         stake: dynamicSignal.recommendedBot.stake,
         martingale: dynamicSignal.recommendedBot.martingale,
         market: activeMarket.displayName,
-        contractType: dynamicSignal.recommendedBot.contractType,
+        contractType: dynamicSignal.recommendedBot.contractType as ContractType,
         targetDigit: dynamicSignal.recommendedBot.targetDigit,
-        strategyId: dynamicSignal.recommendedBot.strategyId,
+        strategyId: dynamicSignal.recommendedBot.strategyId as StrategyId | undefined,
         strategyName: dynamicSignal.recommendedBot.strategyName,
         entryRule: dynamicSignal.recommendedBot.entryRule,
         recoveryRule: dynamicSignal.recommendedBot.recoveryRule,
         takeProfit: dynamicSignal.recommendedBot.takeProfit,
         stopLoss: dynamicSignal.recommendedBot.stopLoss,
         targetRuns: dynamicSignal.recommendedRuns,
-        category: selectedStrategyId.startsWith('strategy-') ? 'Indicators' : 'Deriv Strategies 2',
+        category: (selectedStrategyId.startsWith('strategy-') ? 'Indicators' : 'Deriv Strategies 2') as BotCategory,
       };
       return [newB, ...prev];
     });
@@ -1951,26 +2054,18 @@ export function MarketMindApp() {
   }, [bots, ticks, isRealAccount, runsStepper]);
 
   // Deriv OAuth & Account Actions
-  const handleOAuthLogin = (openDirect = false) => {
-    const authUrl = buildDerivOAuthUrl(effectiveAppId);
-    if (openDirect) {
+  const handleOAuthLogin = async (openDirect = false) => {
+    void openDirect;
+
+    try {
+      const authUrl = await buildDerivOAuthUrl(effectiveAppId);
+
+      // OAuth 2.0 + PKCE uses a full-page redirect so the callback
+      // can return to the exact redirect URI registered in Deriv.
       window.location.href = authUrl;
-      return;
-    }
-
-    const width = 640;
-    const height = 720;
-    const left = window.screenX + (window.outerWidth - width) / 2;
-    const top = window.screenY + (window.outerHeight - height) / 2;
-
-    const popup = window.open(
-      authUrl,
-      'deriv_oauth_login',
-      `width=${width},height=${height},left=${left},top=${top},status=no,resizable=yes,scrollbars=yes`
-    );
-
-    if (!popup || popup.closed || typeof popup.closed === 'undefined') {
-      window.location.href = authUrl;
+    } catch (error) {
+      console.error('Failed to start Deriv OAuth:', error);
+      setAuthToast('Unable to start Deriv authentication.');
     }
   };
 
@@ -2424,7 +2519,7 @@ export function MarketMindApp() {
                             >
                               <span>{st.name}</span>
                               <span className="text-[10px] opacity-75 font-mono px-1 rounded bg-[var(--surface-3)]">
-                                {st.defaultContract}
+                                {String('defaultContract' in st ? st.defaultContract : (st.id.startsWith('under') ? 'Under' : 'Over'))}
                               </span>
                             </button>
                           );
@@ -2476,7 +2571,13 @@ export function MarketMindApp() {
                         </div>
 
                         <div className="grid grid-cols-1 md:grid-cols-2 gap-2 mt-1">
-                          {dynamicSignal.strategySignal.conditions.map((cond, idx) => (
+                          {dynamicSignal.strategySignal.conditions.map((cond, idx) => {
+                            const condition = cond as typeof cond & {
+                              name?: string;
+                              description?: string;
+                            };
+
+                            return (
                             <div
                               key={idx}
                               className={`p-2 rounded text-xs border flex items-start gap-2 ${
@@ -2492,7 +2593,7 @@ export function MarketMindApp() {
                               )}
                               <div className="flex flex-col">
                                 <div className="flex items-center gap-2">
-                                  <span className="font-semibold text-text">{cond.name}</span>
+                                  <span className="font-semibold text-text">{condition.name || `Condition ${idx + 1}`}</span>
                                   <span
                                     className={`text-[10px] px-1.5 py-0.2 rounded font-mono font-bold uppercase ${
                                       cond.met ? 'bg-emerald-500/20 text-emerald-300' : 'bg-amber-500/20 text-amber-300'
@@ -2501,10 +2602,11 @@ export function MarketMindApp() {
                                     {cond.met ? 'Met' : 'Waiting'}
                                   </span>
                                 </div>
-                                <span className="text-[11px] opacity-85 mt-0.5">{cond.description}</span>
+                                <span className="text-[11px] opacity-85 mt-0.5">{condition.description || 'Strategy condition'}</span>
                               </div>
                             </div>
-                          ))}
+                            );
+                          })}
                         </div>
 
                         {/* Strategy Rules & Parameters Expander */}
@@ -2521,30 +2623,36 @@ export function MarketMindApp() {
                             {showStrategyRules ? <ChevronUp size={14} /> : <ChevronDown size={14} />}
                           </button>
 
-                          {showStrategyRules && (
-                            <div className="mt-2.5 p-2.5 rounded bg-[var(--surface-1)] border border-[var(--line)] text-xs text-text-2 flex flex-col gap-2 animate-in fade-in duration-150">
-                              <div>
-                                <strong className="text-text">Setup &amp; Chart:</strong>{' '}
-                                <span>{dynamicSignal.strategySignal.setupInstructions}</span>
+                          {showStrategyRules && (() => {
+                            const details = dynamicSignal.strategySignal as StrategySignalResult & {
+                              setupInstructions?: string;
+                              indicatorsUsed?: string[];
+                            };
+                            return (
+                              <div className="mt-2.5 p-2.5 rounded bg-[var(--surface-1)] border border-[var(--line)] text-xs text-text-2 flex flex-col gap-2 animate-in fade-in duration-150">
+                                <div>
+                                  <strong className="text-text">Setup &amp; Chart:</strong>{' '}
+                                  <span>{details.setupInstructions || 'Use the selected strategy conditions and live chart.'}</span>
+                                </div>
+                                <div>
+                                  <strong className="text-text">Indicators Used:</strong>{' '}
+                                  <span className="font-mono text-accent">{(details.indicatorsUsed || []).join(' · ') || 'Live price and digit analysis'}</span>
+                                </div>
+                                <div>
+                                  <strong className="text-text">Entry Rules:</strong>{' '}
+                                  <span>{details.entryRule}</span>
+                                </div>
+                                <div>
+                                  <strong className="text-text">Exit Rules:</strong>{' '}
+                                  <span>{details.exitRule}</span>
+                                </div>
+                                <div>
+                                  <strong className="text-text">Recovery Protocol:</strong>{' '}
+                                  <span className="text-live font-semibold">{details.recoveryRule}</span>
+                                </div>
                               </div>
-                              <div>
-                                <strong className="text-text">Indicators Used:</strong>{' '}
-                                <span className="font-mono text-accent">{dynamicSignal.strategySignal.indicatorsUsed.join(' · ')}</span>
-                              </div>
-                              <div>
-                                <strong className="text-text">Entry Rules:</strong>{' '}
-                                <span>{dynamicSignal.strategySignal.entryRule}</span>
-                              </div>
-                              <div>
-                                <strong className="text-text">Exit Rules:</strong>{' '}
-                                <span>{dynamicSignal.strategySignal.exitRule}</span>
-                              </div>
-                              <div>
-                                <strong className="text-text">Recovery Protocol:</strong>{' '}
-                                <span className="text-live font-semibold">{dynamicSignal.strategySignal.recoveryRule}</span>
-                              </div>
-                            </div>
-                          )}
+                            );
+                          })()}
                         </div>
                       </div>
                     )}
@@ -4027,7 +4135,7 @@ export function MarketMindApp() {
                 <select
                   className="mmp-select text-xs py-1.5"
                   value={editingBot.category || 'Deriv Strategies 2'}
-                  onChange={(e) => setEditingBot({ ...editingBot, category: e.target.value })}
+                  onChange={(e) => setEditingBot({ ...editingBot, category: e.target.value as BotCategory })}
                 >
                   <option value="Deriv Strategies 2">Deriv Strategies 2</option>
                   <option value="Indicators">Indicators</option>

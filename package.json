@@ -16,11 +16,13 @@
     "lint": "tsc --build --noEmit"
   },
   "dependencies": {
+    "cookie-parser": "^1.4.7",
     "express": "^5.2.1"
   },
   "devDependencies": {
     "@types/express": "^5.0.6",
     "@types/node": "^25.3.3",
+    "@vercel/node": "^13.0.1",
     "esbuild": "0.25.8",
     "prettier": "^3.9.6",
     "tsx": "^4.21.0",
