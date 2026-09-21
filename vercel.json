@@ -6,7 +6,7 @@
   "rewrites": [
     {
       "source": "/callback",
-      "destination": "/"
+      "destination": "/index.html"
     }
   ]
 }
