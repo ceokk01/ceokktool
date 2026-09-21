@@ -102,21 +102,6 @@ type OAuthAccountWithBalance = DerivOAuthAccount & {
   accountType?: string;
 };
 
-function getOAuthAccountType(acct: OAuthAccountWithBalance): 'demo' | 'real' {
-  const type = String(acct.accountType || '').trim().toLowerCase();
-  if (type === 'demo' || type === 'virtual') return 'demo';
-  if (type === 'real' || type === 'live') return 'real';
-  return acct.isVirtual ? 'demo' : 'real';
-}
-
-function isDemoOAuthAccount(acct: OAuthAccountWithBalance): boolean {
-  return getOAuthAccountType(acct) === 'demo';
-}
-
-function isRealOAuthAccount(acct: OAuthAccountWithBalance): boolean {
-  return getOAuthAccountType(acct) === 'real';
-}
-
 export interface Candle {
   open: number;
   high: number;
@@ -645,110 +630,6 @@ export function MarketMindApp() {
 
   const effectiveAppId = (customAppId || config?.publicAppId || DEFAULT_DERIV_APP_ID).trim();
 
-  // Fetch fresh Demo/Real Options account balances from Deriv.
-  // OAuth access tokens identify the user; the account_id selects which
-  // Options account the UI is currently displaying.
-  const refreshOAuthAccounts = async (preferredAccountId?: string) => {
-    const bearer = token.trim();
-    if (!bearer) return;
-
-    try {
-      const response = await fetch('/api/deriv/accounts', {
-        method: 'GET',
-        headers: {
-          Authorization: `Bearer ${bearer}`,
-        },
-        cache: 'no-store',
-      });
-
-      const data = await response.json().catch(() => ({}));
-      if (!response.ok) {
-        throw new Error(
-          data?.error_description || data?.error || `Account refresh failed (${response.status})`,
-        );
-      }
-
-      const rawFreshAccounts = Array.isArray(data?.accounts)
-        ? (data.accounts as Array<Omit<OAuthAccountWithBalance, 'token'> & { token?: string }>)
-        : [];
-
-      if (rawFreshAccounts.length === 0) return;
-
-      // The refresh endpoint intentionally does not return the OAuth token.
-      // Preserve the token already held in browser state for each account.
-      const freshAccounts: OAuthAccountWithBalance[] = rawFreshAccounts.map((acct) => {
-        const existing = oauthAccounts.find((item) => item.account === acct.account);
-        const accountType = String(acct.accountType || existing?.accountType || '').trim().toLowerCase();
-        const isVirtual =
-          accountType === 'demo' ||
-          accountType === 'virtual' ||
-          (accountType === '' && Boolean(acct.isVirtual));
-
-        return {
-          ...acct,
-          accountType: isVirtual ? 'demo' : 'real',
-          isVirtual,
-          token: acct.token || existing?.token || bearer,
-        };
-      });
-
-      saveStoredAccounts(freshAccounts);
-      setOauthAccounts(freshAccounts);
-
-      const desiredId = preferredAccountId || activeAccountLogin;
-      const selected =
-        freshAccounts.find((acct) => acct.account === desiredId) || freshAccounts[0];
-
-      if (!selected) return;
-
-      // Always determine Demo/Real from the account's explicit accountType.
-      // Do not infer the selected account from the OAuth token (the same
-      // OAuth token can authorize both Demo and Real accounts).
-      const selectedIsDemo = isDemoOAuthAccount(selected);
-      const normalizedSelected = {
-        ...selected,
-        accountType: selectedIsDemo ? 'demo' : 'real',
-        isVirtual: selectedIsDemo,
-      };
-
-      const balance = Number(normalizedSelected.balance ?? 0);
-
-      setActiveAccountLogin(normalizedSelected.account);
-      setActiveAccountLoginId(normalizedSelected.account);
-      setIsRealAccount(!selectedIsDemo);
-      setAccountProfile((prev) => ({
-        ...(prev || {}),
-        loginid: normalizedSelected.account,
-        currency: normalizedSelected.currency,
-        balance,
-        isVirtual: selectedIsDemo,
-      }));
-
-      if (selectedIsDemo) {
-        setVirtualAccount({
-          loginid: normalizedSelected.account,
-          balance,
-          currency: normalizedSelected.currency,
-        });
-      } else {
-        setRealAccount({
-          loginid: normalizedSelected.account,
-          balance,
-          currency: normalizedSelected.currency,
-        });
-      }
-    } catch (error) {
-      console.error('Failed to refresh Deriv Options accounts:', error);
-    }
-  };
-
-  // Stored OAuth balances can be stale. Refresh them whenever an OAuth token
-  // is available, including after a page reload and after OAuth login.
-  useEffect(() => {
-    if (!token.trim()) return;
-    void refreshOAuthAccounts();
-  }, [token]);
-
   // Deriv Live WebSocket & Ticks
   const [ticks, setTicks] = useState<Tick[]>(() => generateSeedTicks(ALL_MARKETS[4], 120));
   const [isWsLive, setIsWsLive] = useState<boolean>(false);
@@ -930,7 +811,7 @@ export function MarketMindApp() {
         }
 
         const accounts = Array.isArray(data?.accounts)
-          ? (data.accounts as OAuthAccountWithBalance[])
+          ? (data.accounts as DerivOAuthAccount[])
           : [];
 
         if (accounts.length === 0) {
@@ -951,20 +832,6 @@ export function MarketMindApp() {
         saveStoredToken(first.token);
         setTokenInput(first.token);
         setIsRealAccount(!first.isVirtual);
-        const firstBalance = Number(first.balance ?? 0);
-        setAccountProfile({
-          loginid: first.account,
-          currency: first.currency,
-          balance: firstBalance,
-          isVirtual: first.isVirtual,
-        });
-        if (first.isVirtual) {
-          setVirtualAccount({ loginid: first.account, balance: firstBalance, currency: first.currency });
-          setRealAccount(null);
-        } else {
-          setRealAccount({ loginid: first.account, balance: firstBalance, currency: first.currency });
-          setVirtualAccount(null);
-        }
         setTokenModalOpen(false);
 
         clearOAuthSession();
@@ -1007,9 +874,10 @@ export function MarketMindApp() {
   }, [authToast]);
 
   // Dedicated Deriv Account & Balance WebSocket
-  // OAuth identifies the user. The selected account ID is exchanged for a
-  // one-time Options API WebSocket URL, so Demo and Real accounts have
-  // genuinely separate authenticated connections.
+  // Follows Deriv API authorize & balance specification:
+  // wss://ws.derivws.com/websockets/v3?app_id=${APP_ID}
+  // -> { authorize: token }
+  // -> { balance: 1, subscribe: 1 }
   const accountSocketRef = useRef<WebSocket | null>(null);
 
   useEffect(() => {
@@ -1021,229 +889,117 @@ export function MarketMindApp() {
       return;
     }
 
-    const accountId = activeAccountLogin.trim();
-    if (!accountId) {
-      setIsAuthorizing(false);
-      return;
-    }
-
     let ws: WebSocket | null = null;
     let pingInterval: number | undefined;
     let isCancelled = false;
 
-    const connectAccountSocket = async () => {
-      try {
-        setIsAuthorizing(true);
-        setAuthError(null);
+    setIsAuthorizing(true);
+    setAuthError(null);
 
-        const selectedOAuthAccount = oauthAccounts.find(
-          (acct) => acct.account === accountId,
-        );
+    const wsUrl = `wss://ws.derivws.com/websockets/v3?app_id=${encodeURIComponent(effectiveAppId)}`;
 
-        if (!selectedOAuthAccount) {
-          throw new Error(
-            'The selected Deriv account is not available yet. Please wait for the account list to load.',
-          );
-        }
+    try {
+      ws = new WebSocket(wsUrl);
+      accountSocketRef.current = ws;
 
-        // Always close the previous account connection before switching.
-        if (accountSocketRef.current) {
-          try {
-            accountSocketRef.current.close();
-          } catch {
-            // Ignore close errors.
-          }
-          accountSocketRef.current = null;
-        }
-
-        console.log('Requesting Deriv Options WebSocket OTP for:', {
-          account: accountId,
-          accountType: getOAuthAccountType(selectedOAuthAccount),
-          currency: selectedOAuthAccount.currency,
-        });
-
-        const otpResponse = await fetch('/api/deriv/options-otp', {
-          method: 'POST',
-          headers: {
-            Authorization: `Bearer ${token.trim()}`,
-            'Content-Type': 'application/json',
-          },
-          body: JSON.stringify({ accountId }),
-        });
-
-        const otpData = await otpResponse.json().catch(() => ({}));
-
-        if (!otpResponse.ok) {
-          throw new Error(
-            otpData?.error_description ||
-              otpData?.error ||
-              `Failed to obtain Deriv account WebSocket URL (${otpResponse.status}).`,
-          );
-        }
-
-        const wsUrl = otpData?.websocketUrl;
-        if (!wsUrl) {
-          throw new Error('Deriv did not return a WebSocket URL.');
-        }
-
+      ws.onopen = () => {
         if (isCancelled) return;
+        // Authorize with token
+        ws?.send(JSON.stringify({ authorize: token.trim() }));
 
-        ws = new WebSocket(wsUrl);
-        accountSocketRef.current = ws;
-
-        ws.onopen = () => {
-          if (isCancelled) return;
-
-          console.log(
-            `Deriv account WebSocket connected: ${accountId} (${getOAuthAccountType(selectedOAuthAccount)})`,
-          );
-          setIsAuthorizing(false);
-          setAuthError(null);
-
-          ws?.send(
-            JSON.stringify({
-              balance: 1,
-              subscribe: 1,
-              req_id: 1,
-            }),
-          );
-
-          pingInterval = window.setInterval(() => {
-            if (ws?.readyState === WebSocket.OPEN) {
-              ws.send(JSON.stringify({ ping: 1, req_id: 2 }));
-            }
-          }, 25000);
-        };
-
-        ws.onmessage = (event) => {
-          if (isCancelled) return;
-
-          try {
-            const data = JSON.parse(event.data);
-
-            if (data.error) {
-              const message =
-                data.error.message || 'Deriv account connection error';
-              console.error(
-                `Deriv Account Error [${data.error.code || 'UNKNOWN'}]: ${message}`,
-              );
-              setAuthError(
-                `[${data.error.code || 'ERROR'}]: ${message}`,
-              );
-              setIsAuthorizing(false);
-              return;
-            }
-
-            if (data.msg_type !== 'balance' || !data.balance) return;
-
-            const balanceData = data.balance;
-            const loginid = String(
-              balanceData.loginid || accountId,
-            ).trim();
-            const newBalance = Number(balanceData.balance ?? 0);
-            const currency = String(balanceData.currency || selectedOAuthAccount.currency || 'USD');
-            const accountIsDemo = getOAuthAccountType(selectedOAuthAccount) === 'demo';
-
-            // Update only the account represented by this socket.
-            setOauthAccounts((previous) =>
-              previous.map((account) =>
-                account.account === accountId
-                  ? { ...account, balance: newBalance, currency }
-                  : account,
-              ),
-            );
-
-            setAccountProfile((previous) => ({
-              ...(previous || {}),
-              loginid,
-              currency,
-              balance: newBalance,
-              isVirtual: accountIsDemo,
-            }));
-
-            if (accountIsDemo) {
-              setVirtualAccount({
-                loginid,
-                balance: newBalance,
-                currency,
-              });
-            } else {
-              setRealAccount({
-                loginid,
-                balance: newBalance,
-                currency,
-              });
-            }
-
-            saveStoredAccounts(
-              oauthAccounts.map((account) =>
-                account.account === accountId
-                  ? { ...account, balance: newBalance, currency }
-                  : account,
-              ),
-            );
-          } catch (error) {
-            console.error('Failed to process account WebSocket message:', error);
+        // Deriv closes idle connections after ~2 minutes; keep-alive every 25s
+        pingInterval = window.setInterval(() => {
+          if (ws?.readyState === WebSocket.OPEN) {
+            ws.send(JSON.stringify({ ping: 1 }));
           }
-        };
+        }, 25000);
+      };
 
-        ws.onerror = (error) => {
-          if (isCancelled) return;
-          console.error(`Deriv account WebSocket error for ${accountId}:`, error);
-          setAuthError('Deriv account WebSocket connection failed.');
-          setIsAuthorizing(false);
-        };
+      ws.onmessage = (event) => {
+        if (isCancelled) return;
+        try {
+          const data = JSON.parse(event.data);
 
-        ws.onclose = () => {
-          if (pingInterval !== undefined) {
-            window.clearInterval(pingInterval);
-            pingInterval = undefined;
-          }
-
-          if (accountSocketRef.current === ws) {
-            accountSocketRef.current = null;
-          }
-
-          if (!isCancelled) {
-            console.log(`Deriv account WebSocket closed: ${accountId}`);
+          if (data.error) {
+            console.error(`Deriv Account Error [${data.error.code}]: ${data.error.message}`);
+            setAuthError(`[${data.error.code}]: ${data.error.message}`);
             setIsAuthorizing(false);
+            return;
           }
-        };
-      } catch (error) {
-        if (isCancelled) return;
 
-        console.error(`Failed to connect account ${accountId}:`, error);
-        setAuthError(
-          error instanceof Error
-            ? error.message
-            : 'Failed to connect to Deriv account.',
-        );
-        setIsAuthorizing(false);
-      }
-    };
+          if (data.msg_type === 'authorize' || data.authorize) {
+            const auth = data.authorize;
+            const isVirtual = Boolean(auth.is_virtual);
+            const bal = Number(auth.balance ?? 0);
+            const cur = auth.currency || 'USD';
 
-    void connectAccountSocket();
+            const profile: DerivAccountProfile = {
+              loginid: auth.loginid,
+              fullname: auth.fullname,
+              email: auth.email,
+              currency: cur,
+              balance: bal,
+              isVirtual,
+            };
+
+            setAccountProfile(profile);
+            setIsAuthorizing(false);
+            setAuthError(null);
+
+            if (isVirtual) {
+              setVirtualAccount({ loginid: auth.loginid, balance: bal, currency: cur });
+            } else {
+              setRealAccount({ loginid: auth.loginid, balance: bal, currency: cur });
+            }
+
+            // Subscribe to real-time balance stream
+            ws?.send(JSON.stringify({ balance: 1, subscribe: 1 }));
+          }
+
+          if (data.msg_type === 'balance' || data.balance) {
+            const b = data.balance;
+            const newBal = Number(b.balance);
+            const cur = b.currency || 'USD';
+
+            setAccountProfile((prev) => (prev ? { ...prev, balance: newBal, currency: cur } : null));
+
+            const isVirt = b.loginid?.startsWith('VR') || accountProfile?.isVirtual;
+            if (isVirt) {
+              setVirtualAccount((prev) => (prev ? { ...prev, balance: newBal, currency: cur } : { loginid: b.loginid || 'VRTC', balance: newBal, currency: cur }));
+            } else {
+              setRealAccount((prev) => (prev ? { ...prev, balance: newBal, currency: cur } : { loginid: b.loginid || 'Real', balance: newBal, currency: cur }));
+            }
+          }
+        } catch {
+          // ignore parsing error
+        }
+      };
+
+      ws.onerror = (err) => {
+        if (!isCancelled) {
+          console.error('Deriv account socket error:', err);
+          setIsAuthorizing(false);
+        }
+      };
+
+      ws.onclose = () => {
+        if (!isCancelled) {
+          setIsAuthorizing(false);
+        }
+      };
+    } catch (err: any) {
+      setAuthError(err?.message || 'Failed to connect to Deriv');
+      setIsAuthorizing(false);
+    }
 
     return () => {
       isCancelled = true;
-
-      if (pingInterval !== undefined) {
-        window.clearInterval(pingInterval);
-      }
-
+      if (pingInterval) clearInterval(pingInterval);
       if (ws) {
-        try {
-          ws.close();
-        } catch {
-          // Ignore close errors.
-        }
-      }
-
-      if (accountSocketRef.current === ws) {
-        accountSocketRef.current = null;
+        ws.close();
       }
     };
-  }, [token, activeAccountLogin]);
+  }, [token, effectiveAppId]);
 
   // Connect to Deriv Public WebSocket
   useEffect(() => {
@@ -1589,9 +1345,9 @@ export function MarketMindApp() {
 
       const recommendedBot = {
         name: strategySignal.recommendedBotName,
-        contractType: strategySignal.contractType,
+        contractType: strategySignal.contractType as ContractType,
         targetDigit: strategySignal.predictionDigit,
-        strategyId: strategySignal.strategyId,
+        strategyId: strategySignal.strategyId as StrategyId | undefined,
         strategyName: strategySignal.strategyName,
         category: (selectedStrategyId.startsWith('strategy-') ? 'Indicators' : 'Deriv Strategies 2') as BotCategory,
         entryRule: strategySignal.entryRule,
@@ -1714,14 +1470,16 @@ export function MarketMindApp() {
     };
   }, [signalMode, strategySignal, activeSignalType, ticks, digitStats, activeMarket.displayName]);
 
-  // Current balance to display. For OAuth2, balance belongs to the
-  // selected account returned by GET /trading/v1/options/accounts.
-  const activeOAuthAccount = oauthAccounts.find((acct) => acct.account === activeAccountLogin);
-  const currentBalance = activeOAuthAccount && typeof activeOAuthAccount.balance === 'number'
-    ? activeOAuthAccount.balance
+  // Current balance follows the exact selected OAuth account.
+  const activeOAuthAccount = oauthAccounts.find(
+    (acct) => acct.account === activeAccountLogin,
+  );
+
+  const currentBalance = activeOAuthAccount?.balance !== undefined
+    ? Number(activeOAuthAccount.balance)
     : isRealAccount
-      ? (realAccount ? realAccount.balance : 0.0)
-      : (virtualAccount ? virtualAccount.balance : demoBalance);
+      ? (realAccount?.balance ?? 0)
+      : (virtualAccount?.balance ?? demoBalance);
 
   const currentCurrency = activeOAuthAccount?.currency
     || (isRealAccount ? (realAccount?.currency || 'USD') : (virtualAccount?.currency || 'USD'));
@@ -1870,11 +1628,11 @@ export function MarketMindApp() {
       id: undefined,
       name: dynamicSignal.recommendedBot.name,
       market: activeMarket.displayName,
-      contractType: dynamicSignal.recommendedBot.contractType as ContractType,
+      contractType: dynamicSignal.recommendedBot.contractType,
       targetDigit: dynamicSignal.recommendedBot.targetDigit,
-      strategyId: dynamicSignal.recommendedBot.strategyId as StrategyId | undefined,
+      strategyId: dynamicSignal.recommendedBot.strategyId,
       strategyName: dynamicSignal.recommendedBot.strategyName,
-      category: (dynamicSignal.recommendedBot.category || (selectedStrategyId.startsWith('strategy-') ? 'Indicators' : 'Deriv Strategies 2')) as BotCategory,
+      category: dynamicSignal.recommendedBot.category || (selectedStrategyId.startsWith('strategy-') ? 'Indicators' : 'Deriv Strategies 2'),
       entryRule: dynamicSignal.recommendedBot.entryRule,
       exitRule: dynamicSignal.recommendedBot.exitRule,
       recoveryRule: dynamicSignal.recommendedBot.recoveryRule,
@@ -1945,9 +1703,9 @@ export function MarketMindApp() {
         stake: dynamicSignal.recommendedBot.stake,
         martingale: dynamicSignal.recommendedBot.martingale,
         market: activeMarket.displayName,
-        contractType: dynamicSignal.recommendedBot.contractType as ContractType,
+        contractType: dynamicSignal.recommendedBot.contractType,
         targetDigit: dynamicSignal.recommendedBot.targetDigit,
-        strategyId: dynamicSignal.recommendedBot.strategyId as StrategyId | undefined,
+        strategyId: dynamicSignal.recommendedBot.strategyId,
         strategyName: dynamicSignal.recommendedBot.strategyName,
         entryRule: dynamicSignal.recommendedBot.entryRule,
         recoveryRule: dynamicSignal.recommendedBot.recoveryRule,
@@ -2323,45 +2081,40 @@ export function MarketMindApp() {
   };
 
   const handleSelectOAuthAccount = (acct: OAuthAccountWithBalance) => {
-    const accountIsDemo = isDemoOAuthAccount(acct);
-    const balance = Number(acct.balance ?? 0);
-
-    // This account is now the single active account everywhere in the UI.
     setActiveAccountLogin(acct.account);
     setActiveAccountLoginId(acct.account);
-    setIsRealAccount(!accountIsDemo);
+    setToken(acct.token);
+    setTokenInput(acct.token);
+    saveStoredToken(acct.token);
+    setIsRealAccount(!acct.isVirtual);
+    setAccountMenuOpen(false);
+  };
 
-    // The OAuth bearer token belongs to the user, not to one Demo/Real
-    // account. Keep it unchanged; the account ID selects the account.
-    if (acct.token) {
-      setToken(acct.token);
-      setTokenInput(acct.token);
-      saveStoredToken(acct.token);
-    }
-
-    setAccountProfile({
-      loginid: acct.account,
-      currency: acct.currency,
-      balance,
-      isVirtual: accountIsDemo,
-    });
-
-    if (accountIsDemo) {
-      setVirtualAccount({
-        loginid: acct.account,
-        balance,
-        currency: acct.currency,
-      });
+  const handleToggleRealDemo = (targetReal: boolean) => {
+    if (targetReal) {
+      const realAcct = oauthAccounts.find((a) => !a.isVirtual);
+      if (realAcct && realAcct.token !== token) {
+        setActiveAccountLogin(realAcct.account);
+        setActiveAccountLoginId(realAcct.account);
+        setToken(realAcct.token);
+        setTokenInput(realAcct.token);
+        saveStoredToken(realAcct.token);
+      }
+      setIsRealAccount(true);
+      if (!token && !realAcct) {
+        setTokenModalOpen(true);
+      }
     } else {
-      setRealAccount({
-        loginid: acct.account,
-        balance,
-        currency: acct.currency,
-      });
+      const virtAcct = oauthAccounts.find((a) => a.isVirtual);
+      if (virtAcct && virtAcct.token !== token) {
+        setActiveAccountLogin(virtAcct.account);
+        setActiveAccountLoginId(virtAcct.account);
+        setToken(virtAcct.token);
+        setTokenInput(virtAcct.token);
+        saveStoredToken(virtAcct.token);
+      }
+      setIsRealAccount(false);
     }
-
-    // Immediately refresh the exact selected account by ID.
-    void refreshOAuthAccounts(acct.account);
   };
 
   const handleSaveAppId = (newAppId: string) => {
@@ -2474,99 +2227,157 @@ export function MarketMindApp() {
         <div className="topbar-right">
           <div className="balance" role="group" aria-label="Account balance">
             <div className="balance-figure">
-              <span className="balance-label">ACCOUNT BALANCE</span>
+              <span className="balance-label">
+                ACCOUNT BALANCE
+              </span>
               <span className="balance-amount">
                 <span className="cur">{currentCurrency}</span>
-                {currentBalance.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
+                {currentBalance.toLocaleString(undefined, {
+                  minimumFractionDigits: 2,
+                  maximumFractionDigits: 2,
+                })}
               </span>
             </div>
           </div>
 
-          {token && (activeOAuthAccount || realAccount || virtualAccount || accountProfile) ? (
+          {token && (oauthAccounts.length > 0 || realAccount || virtualAccount || accountProfile) ? (
             <div className="relative">
               <button
-                className="btn btn-outline border-emerald-500/40 text-emerald-400 bg-emerald-950/20 hover:bg-emerald-900/30 min-w-[190px] justify-between"
+                className="btn btn-outline border-emerald-500/40 text-emerald-400 bg-emerald-950/20 hover:bg-emerald-900/30 min-w-[210px]"
                 type="button"
                 aria-haspopup="menu"
                 aria-expanded={accountMenuOpen}
                 onClick={() => setAccountMenuOpen((open) => !open)}
               >
-                <span className="flex items-center gap-1.5 min-w-0">
-                  <span className="h-2 w-2 shrink-0 rounded-full bg-emerald-400 animate-pulse"></span>
-                  <span className="font-mono text-xs font-semibold truncate">
-                    {activeOAuthAccount?.account || accountProfile?.loginid || realAccount?.loginid || virtualAccount?.loginid}
-                  </span>
-                  <span className="text-[10px] opacity-75 shrink-0">
-                    ({activeOAuthAccount ? (isDemoOAuthAccount(activeOAuthAccount) ? 'Demo' : 'Real') : (isRealAccount ? 'Real' : 'Demo')})
+                <span className="flex items-center justify-between gap-3 w-full">
+                  <span className="flex items-center gap-1.5 min-w-0">
+                    <span className="h-2 w-2 shrink-0 rounded-full bg-emerald-400 animate-pulse"></span>
+                    <span className="font-mono text-xs font-semibold truncate">
+                      {activeOAuthAccount?.account ||
+                        accountProfile?.loginid ||
+                        realAccount?.loginid ||
+                        virtualAccount?.loginid ||
+                        'Select account'}
+                    </span>
+                    <span className="text-[10px] opacity-75 shrink-0">
+                      ({activeOAuthAccount?.isVirtual || accountProfile?.isVirtual ? 'Demo' : 'Real'})
+                    </span>
+                    <ChevronDown
+                      size={15}
+                      className={`shrink-0 transition-transform ${accountMenuOpen ? 'rotate-180' : ''}`}
+                    />
                   </span>
                 </span>
-                <ChevronDown size={15} className={`shrink-0 transition-transform ${accountMenuOpen ? 'rotate-180' : ''}`} />
               </button>
 
               {accountMenuOpen && (
                 <div
-                  className="absolute right-0 top-[calc(100%+8px)] z-50 w-[280px] overflow-hidden rounded-xl border border-slate-700/80 bg-slate-950/95 shadow-2xl backdrop-blur"
                   role="menu"
                   aria-label="Deriv accounts"
+                  className="absolute right-0 top-[calc(100%+8px)] z-50 w-[310px] rounded-xl border border-[var(--line)] bg-[var(--surface)] p-2 shadow-2xl"
                 >
-                  <div className="border-b border-slate-800 px-4 py-3">
-                    <div className="text-[10px] font-semibold uppercase tracking-wider text-slate-500">
-                      Deriv account
+                  <div className="px-2.5 py-2">
+                    <div className="text-xs font-semibold text-text">Deriv Accounts</div>
+                    <div className="text-[11px] text-text-3 mt-0.5">
+                      Select the account to use
                     </div>
-                    <div className="mt-1 text-xs text-slate-400">Select the account to use</div>
                   </div>
 
-                  <div className="max-h-72 overflow-y-auto p-2">
-                    {oauthAccounts.length > 0 ? oauthAccounts.map((acct) => {
-                      const accountIsDemo = isDemoOAuthAccount(acct);
-                      const selected = acct.account === activeAccountLogin;
-                      const balance = typeof acct.balance === 'number' ? acct.balance : 0;
+                  <div className="max-h-[320px] overflow-y-auto space-y-1">
+                    {oauthAccounts.length > 0 ? (
+                      oauthAccounts.map((acct) => {
+                        const isCurrent = acct.account === activeAccountLogin;
+                        const isDemo = Boolean(acct.isVirtual);
+                        const balance = typeof acct.balance === 'number'
+                          ? acct.balance
+                          : isCurrent
+                            ? currentBalance
+                            : undefined;
 
-                      return (
-                        <button
-                          key={acct.account}
-                          type="button"
-                          role="menuitem"
-                          className={`w-full rounded-lg px-3 py-3 text-left transition ${selected ? 'bg-emerald-500/10 ring-1 ring-emerald-500/30' : 'hover:bg-slate-800/80'}`}
-                          onClick={() => {
-                            handleSelectOAuthAccount(acct);
-                            setAccountMenuOpen(false);
-                          }}
-                        >
-                          <div className="flex items-center justify-between gap-3">
-                            <div className="min-w-0">
-                              <div className="flex items-center gap-2">
-                                <span className={`h-2 w-2 rounded-full ${accountIsDemo ? 'bg-sky-400' : 'bg-emerald-400'}`}></span>
-                                <span className="font-mono text-xs font-semibold text-slate-100 truncate">{acct.account}</span>
+                        return (
+                          <button
+                            key={acct.account}
+                            type="button"
+                            role="menuitem"
+                            className={`w-full rounded-lg border p-2.5 text-left transition-all ${
+                              isCurrent
+                                ? 'border-emerald-500/60 bg-emerald-950/20'
+                                : 'border-[var(--line)] bg-[var(--surface-2)]/50 hover:border-[var(--line-2)] hover:bg-[var(--surface-2)]'
+                            }`}
+                            onClick={() => {
+                              handleSelectOAuthAccount(acct);
+                              setAccountMenuOpen(false);
+                            }}
+                          >
+                            <div className="flex items-center justify-between gap-3">
+                              <div className="min-w-0">
+                                <div className="flex items-center gap-2">
+                                  <span
+                                    className={`h-2 w-2 rounded-full ${
+                                      isCurrent
+                                        ? 'bg-emerald-400'
+                                        : isDemo
+                                          ? 'bg-sky-400'
+                                          : 'bg-slate-400'
+                                    }`}
+                                  ></span>
+                                  <span className="font-mono text-xs font-semibold text-text truncate">
+                                    {acct.account}
+                                  </span>
+                                </div>
+                                <div className="mt-1 pl-4 text-[10px] text-text-3">
+                                  {isDemo ? 'Demo' : 'Real'} · {acct.currency || 'USD'}
+                                </div>
                               </div>
-                              <div className="mt-1 pl-4 text-[10px] text-slate-400">
-                                {accountIsDemo ? 'Demo' : 'Real'} · {acct.currency || 'USD'}
+
+                              <div className="text-right shrink-0">
+                                {isCurrent && (
+                                  <div className="mb-1 text-[9px] font-semibold uppercase text-emerald-400">
+                                    Active
+                                  </div>
+                                )}
+                                <div className="text-xs font-mono text-text">
+                                  {typeof balance === 'number'
+                                    ? balance.toLocaleString(undefined, {
+                                        minimumFractionDigits: 2,
+                                        maximumFractionDigits: 2,
+                                      })
+                                    : '--'}
+                                </div>
                               </div>
                             </div>
-                            <div className="shrink-0 text-right">
-                              <div className="text-xs font-semibold text-slate-200">
-                                {Number(balance).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
-                              </div>
-                              {selected && <div className="text-[9px] text-emerald-400">ACTIVE</div>}
-                            </div>
-                          </div>
-                        </button>
-                      );
-                    }) : (
-                      <div className="px-3 py-4 text-center text-xs text-slate-500">No Deriv accounts available.</div>
+                          </button>
+                        );
+                      })
+                    ) : (
+                      <div className="px-3 py-4 text-center text-xs text-text-3">
+                        No Deriv accounts available yet.
+                      </div>
                     )}
                   </div>
 
-                  <div className="border-t border-slate-800 p-2">
+                  <div className="mt-2 border-t border-[var(--line)] pt-2">
                     <button
                       type="button"
-                      className="w-full rounded-lg px-3 py-2 text-left text-xs text-slate-400 transition hover:bg-slate-800 hover:text-slate-100"
+                      className="w-full rounded-lg px-3 py-2 text-left text-xs text-text-2 hover:bg-[var(--surface-2)] hover:text-text"
+                      onClick={() => {
+                        setAccountMenuOpen(false);
+                        setTokenModalOpen(true);
+                      }}
+                    >
+                      Manage Deriv connection
+                    </button>
+
+                    <button
+                      type="button"
+                      className="w-full rounded-lg px-3 py-2 text-left text-xs text-red-400 hover:bg-red-950/20"
                       onClick={() => {
                         setAccountMenuOpen(false);
                         handleLogout();
                       }}
                     >
-                      Log out of Deriv
+                      <LogOut size={14} className="mr-1.5 inline" />
+                      Disconnect account
                     </button>
                   </div>
                 </div>
@@ -2921,7 +2732,7 @@ export function MarketMindApp() {
                                     {cond.met ? 'Met' : 'Waiting'}
                                   </span>
                                 </div>
-                                <span className="text-[11px] opacity-85 mt-0.5">{condition.description || 'Strategy condition'}</span>
+                                <span className="text-[11px] opacity-85 mt-0.5">{String(condition.description || 'Strategy condition')}</span>
                               </div>
                             </div>
                             );
@@ -2942,36 +2753,30 @@ export function MarketMindApp() {
                             {showStrategyRules ? <ChevronUp size={14} /> : <ChevronDown size={14} />}
                           </button>
 
-                          {showStrategyRules && (() => {
-                            const details = dynamicSignal.strategySignal as StrategySignalResult & {
-                              setupInstructions?: string;
-                              indicatorsUsed?: string[];
-                            };
-                            return (
-                              <div className="mt-2.5 p-2.5 rounded bg-[var(--surface-1)] border border-[var(--line)] text-xs text-text-2 flex flex-col gap-2 animate-in fade-in duration-150">
-                                <div>
-                                  <strong className="text-text">Setup &amp; Chart:</strong>{' '}
-                                  <span>{details.setupInstructions || 'Use the selected strategy conditions and live chart.'}</span>
-                                </div>
-                                <div>
-                                  <strong className="text-text">Indicators Used:</strong>{' '}
-                                  <span className="font-mono text-accent">{(details.indicatorsUsed || []).join(' · ') || 'Live price and digit analysis'}</span>
-                                </div>
-                                <div>
-                                  <strong className="text-text">Entry Rules:</strong>{' '}
-                                  <span>{details.entryRule}</span>
-                                </div>
-                                <div>
-                                  <strong className="text-text">Exit Rules:</strong>{' '}
-                                  <span>{details.exitRule}</span>
-                                </div>
-                                <div>
-                                  <strong className="text-text">Recovery Protocol:</strong>{' '}
-                                  <span className="text-live font-semibold">{details.recoveryRule}</span>
-                                </div>
+                          {showStrategyRules && (
+                            <div className="mt-2.5 p-2.5 rounded bg-[var(--surface-1)] border border-[var(--line)] text-xs text-text-2 flex flex-col gap-2 animate-in fade-in duration-150">
+                              <div>
+                                <strong className="text-text">Setup &amp; Chart:</strong>{' '}
+                                <span>{dynamicSignal.strategySignal.entryRule || 'Follow the active strategy conditions shown above.'}</span>
                               </div>
-                            );
-                          })()}
+                              <div>
+                                <strong className="text-text">Indicators Used:</strong>{' '}
+                                <span className="font-mono text-accent">{dynamicSignal.strategySignal.strategyName || dynamicSignal.strategySignal.strategyId || 'Active strategy'}</span>
+                              </div>
+                              <div>
+                                <strong className="text-text">Entry Rules:</strong>{' '}
+                                <span>{dynamicSignal.strategySignal.entryRule}</span>
+                              </div>
+                              <div>
+                                <strong className="text-text">Exit Rules:</strong>{' '}
+                                <span>{dynamicSignal.strategySignal.exitRule}</span>
+                              </div>
+                              <div>
+                                <strong className="text-text">Recovery Protocol:</strong>{' '}
+                                <span className="text-live font-semibold">{dynamicSignal.strategySignal.recoveryRule}</span>
+                              </div>
+                            </div>
+                          )}
                         </div>
                       </div>
                     )}
