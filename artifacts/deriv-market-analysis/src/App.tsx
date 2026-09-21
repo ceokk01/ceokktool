@@ -634,6 +634,7 @@ export function MarketMindApp() {
   const [token, setToken] = useState<string>(() => getStoredToken());
   const [customAppId, setCustomAppId] = useState<string>(() => getStoredAppId());
   const [tokenModalOpen, setTokenModalOpen] = useState(false);
+  const [accountMenuOpen, setAccountMenuOpen] = useState(false);
   const [tokenInput, setTokenInput] = useState(token);
   const [isAuthorizing, setIsAuthorizing] = useState<boolean>(false);
   const [authError, setAuthError] = useState<string | null>(null);
@@ -2363,31 +2364,6 @@ export function MarketMindApp() {
     void refreshOAuthAccounts(acct.account);
   };
 
-  const handleToggleRealDemo = (targetReal: boolean) => {
-    const targetType: 'demo' | 'real' = targetReal ? 'real' : 'demo';
-
-    // Select by the explicit account type, never by the shared OAuth token.
-    const selected = oauthAccounts.find(
-      (acct) => getOAuthAccountType(acct) === targetType,
-    );
-
-    if (!selected) {
-      setAuthError(
-        targetReal
-          ? 'No Real Options account was returned by Deriv.'
-          : 'No Demo Options account was returned by Deriv.',
-      );
-      setAuthToast(
-        targetReal
-          ? 'No Real account is available.'
-          : 'No Demo account is available.',
-      );
-      return;
-    }
-
-    handleSelectOAuthAccount(selected);
-  };
-
   const handleSaveAppId = (newAppId: string) => {
     const trimmed = newAppId.trim();
     setCustomAppId(trimmed);
@@ -2497,28 +2473,8 @@ export function MarketMindApp() {
 
         <div className="topbar-right">
           <div className="balance" role="group" aria-label="Account balance">
-            <div className="balance-switch">
-              <button
-                className={isRealAccount ? 'is-active' : ''}
-                type="button"
-                onClick={() => handleToggleRealDemo(true)}
-              >
-                Real
-              </button>
-              <button
-                className={!isRealAccount ? 'is-active' : ''}
-                type="button"
-                onClick={() => handleToggleRealDemo(false)}
-              >
-                Demo
-              </button>
-            </div>
             <div className="balance-figure">
-              <span className="balance-label">
-                {isRealAccount
-                  ? (realAccount ? realAccount.loginid : (activeOAuthAccount?.account || 'Real Balance'))
-                  : (virtualAccount ? virtualAccount.loginid : (activeOAuthAccount?.account || 'Demo Balance'))}
-              </span>
+              <span className="balance-label">ACCOUNT BALANCE</span>
               <span className="balance-amount">
                 <span className="cur">{currentCurrency}</span>
                 {currentBalance.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
@@ -2526,28 +2482,108 @@ export function MarketMindApp() {
             </div>
           </div>
 
-          <button
-            className={`btn ${token && (realAccount || virtualAccount || accountProfile) ? 'btn-outline border-emerald-500/40 text-emerald-400 bg-emerald-950/20 hover:bg-emerald-900/30' : 'btn-primary bg-[#ff444f] hover:bg-[#eb3c46] border-none text-white'}`}
-            type="button"
-            onClick={() => setTokenModalOpen(true)}
-          >
-            {token && (realAccount || virtualAccount || accountProfile) ? (
-              <span className="flex items-center gap-1.5">
-                <span className="h-2 w-2 rounded-full bg-emerald-400 animate-pulse"></span>
-                <span className="font-mono text-xs font-semibold">
-                  {accountProfile?.loginid || realAccount?.loginid || virtualAccount?.loginid}
+          {token && (activeOAuthAccount || realAccount || virtualAccount || accountProfile) ? (
+            <div className="relative">
+              <button
+                className="btn btn-outline border-emerald-500/40 text-emerald-400 bg-emerald-950/20 hover:bg-emerald-900/30 min-w-[190px] justify-between"
+                type="button"
+                aria-haspopup="menu"
+                aria-expanded={accountMenuOpen}
+                onClick={() => setAccountMenuOpen((open) => !open)}
+              >
+                <span className="flex items-center gap-1.5 min-w-0">
+                  <span className="h-2 w-2 shrink-0 rounded-full bg-emerald-400 animate-pulse"></span>
+                  <span className="font-mono text-xs font-semibold truncate">
+                    {activeOAuthAccount?.account || accountProfile?.loginid || realAccount?.loginid || virtualAccount?.loginid}
+                  </span>
+                  <span className="text-[10px] opacity-75 shrink-0">
+                    ({activeOAuthAccount ? (isDemoOAuthAccount(activeOAuthAccount) ? 'Demo' : 'Real') : (isRealAccount ? 'Real' : 'Demo')})
+                  </span>
                 </span>
-                <span className="text-[10px] opacity-75">
-                  ({isRealAccount ? 'Real' : 'Demo'})
-                </span>
-              </span>
-            ) : (
+                <ChevronDown size={15} className={`shrink-0 transition-transform ${accountMenuOpen ? 'rotate-180' : ''}`} />
+              </button>
+
+              {accountMenuOpen && (
+                <div
+                  className="absolute right-0 top-[calc(100%+8px)] z-50 w-[280px] overflow-hidden rounded-xl border border-slate-700/80 bg-slate-950/95 shadow-2xl backdrop-blur"
+                  role="menu"
+                  aria-label="Deriv accounts"
+                >
+                  <div className="border-b border-slate-800 px-4 py-3">
+                    <div className="text-[10px] font-semibold uppercase tracking-wider text-slate-500">
+                      Deriv account
+                    </div>
+                    <div className="mt-1 text-xs text-slate-400">Select the account to use</div>
+                  </div>
+
+                  <div className="max-h-72 overflow-y-auto p-2">
+                    {oauthAccounts.length > 0 ? oauthAccounts.map((acct) => {
+                      const accountIsDemo = isDemoOAuthAccount(acct);
+                      const selected = acct.account === activeAccountLogin;
+                      const balance = typeof acct.balance === 'number' ? acct.balance : 0;
+
+                      return (
+                        <button
+                          key={acct.account}
+                          type="button"
+                          role="menuitem"
+                          className={`w-full rounded-lg px-3 py-3 text-left transition ${selected ? 'bg-emerald-500/10 ring-1 ring-emerald-500/30' : 'hover:bg-slate-800/80'}`}
+                          onClick={() => {
+                            handleSelectOAuthAccount(acct);
+                            setAccountMenuOpen(false);
+                          }}
+                        >
+                          <div className="flex items-center justify-between gap-3">
+                            <div className="min-w-0">
+                              <div className="flex items-center gap-2">
+                                <span className={`h-2 w-2 rounded-full ${accountIsDemo ? 'bg-sky-400' : 'bg-emerald-400'}`}></span>
+                                <span className="font-mono text-xs font-semibold text-slate-100 truncate">{acct.account}</span>
+                              </div>
+                              <div className="mt-1 pl-4 text-[10px] text-slate-400">
+                                {accountIsDemo ? 'Demo' : 'Real'} · {acct.currency || 'USD'}
+                              </div>
+                            </div>
+                            <div className="shrink-0 text-right">
+                              <div className="text-xs font-semibold text-slate-200">
+                                {Number(balance).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
+                              </div>
+                              {selected && <div className="text-[9px] text-emerald-400">ACTIVE</div>}
+                            </div>
+                          </div>
+                        </button>
+                      );
+                    }) : (
+                      <div className="px-3 py-4 text-center text-xs text-slate-500">No Deriv accounts available.</div>
+                    )}
+                  </div>
+
+                  <div className="border-t border-slate-800 p-2">
+                    <button
+                      type="button"
+                      className="w-full rounded-lg px-3 py-2 text-left text-xs text-slate-400 transition hover:bg-slate-800 hover:text-slate-100"
+                      onClick={() => {
+                        setAccountMenuOpen(false);
+                        handleLogout();
+                      }}
+                    >
+                      Log out of Deriv
+                    </button>
+                  </div>
+                </div>
+              )}
+            </div>
+          ) : (
+            <button
+              className="btn btn-primary bg-[#ff444f] hover:bg-[#eb3c46] border-none text-white"
+              type="button"
+              onClick={() => setTokenModalOpen(true)}
+            >
               <span className="flex items-center gap-1.5 font-medium">
                 <Zap size={14} className="text-white" />
                 Log in with Deriv
               </span>
-            )}
-          </button>
+            </button>
+          )}
         </div>
       </header>
 
