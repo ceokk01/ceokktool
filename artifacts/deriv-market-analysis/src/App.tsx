@@ -97,6 +97,11 @@ type BotCategory =
   | 'Indicators'
   | 'General';
 
+type OAuthAccountWithBalance = DerivOAuthAccount & {
+  balance?: number;
+  accountType?: string;
+};
+
 export interface Candle {
   open: number;
   high: number;
@@ -609,7 +614,7 @@ export function MarketMindApp() {
   const [realAccount, setRealAccount] = useState<{ loginid: string; balance: number; currency: string } | null>(null);
   const [virtualAccount, setVirtualAccount] = useState<{ loginid: string; balance: number; currency: string } | null>(null);
   const [accountProfile, setAccountProfile] = useState<DerivAccountProfile | null>(null);
-  const [oauthAccounts, setOauthAccounts] = useState<DerivOAuthAccount[]>(() => getStoredAccounts());
+  const [oauthAccounts, setOauthAccounts] = useState<OAuthAccountWithBalance[]>(() => getStoredAccounts() as OAuthAccountWithBalance[]);
   const [activeAccountLogin, setActiveAccountLogin] = useState<string>(() => getActiveAccountLoginId());
   const [token, setToken] = useState<string>(() => getStoredToken());
   const [customAppId, setCustomAppId] = useState<string>(() => getStoredAppId());
@@ -805,7 +810,7 @@ export function MarketMindApp() {
         }
 
         const accounts = Array.isArray(data?.accounts)
-          ? (data.accounts as DerivOAuthAccount[])
+          ? (data.accounts as OAuthAccountWithBalance[])
           : [];
 
         if (accounts.length === 0) {
@@ -826,6 +831,20 @@ export function MarketMindApp() {
         saveStoredToken(first.token);
         setTokenInput(first.token);
         setIsRealAccount(!first.isVirtual);
+        const firstBalance = Number(first.balance ?? 0);
+        setAccountProfile({
+          loginid: first.account,
+          currency: first.currency,
+          balance: firstBalance,
+          isVirtual: first.isVirtual,
+        });
+        if (first.isVirtual) {
+          setVirtualAccount({ loginid: first.account, balance: firstBalance, currency: first.currency });
+          setRealAccount(null);
+        } else {
+          setRealAccount({ loginid: first.account, balance: firstBalance, currency: first.currency });
+          setVirtualAccount(null);
+        }
         setTokenModalOpen(false);
 
         clearOAuthSession();
@@ -868,12 +887,23 @@ export function MarketMindApp() {
   }, [authToast]);
 
   // Dedicated Deriv Account & Balance WebSocket
-  // Uses the selected OAuth account's token + Options API OTP flow.
-  // The OAuth account metadata (acct.isVirtual) is the source of truth for
-  // Demo vs Real. We do not infer account type from the login-id prefix.
+  // Follows Deriv API authorize & balance specification:
+  // wss://ws.derivws.com/websockets/v3?app_id=${APP_ID}
+  // -> { authorize: token }
+  // -> { balance: 1, subscribe: 1 }
   const accountSocketRef = useRef<WebSocket | null>(null);
 
   useEffect(() => {
+    // OAuth2 provides one bearer token for the authenticated user, while the
+    // selected account (demo/real) is represented by the account record.
+    // Do not use the legacy authorize/balance socket here because it can
+    // return the same/current account balance and overwrite the selected
+    // OAuth account. OAuth balances come from /trading/v1/options/accounts.
+    if (oauthAccounts.length > 0) {
+      setIsAuthorizing(false);
+      return;
+    }
+
     if (!token.trim()) {
       setAccountProfile(null);
       setRealAccount(null);
@@ -886,210 +916,113 @@ export function MarketMindApp() {
     let pingInterval: number | undefined;
     let isCancelled = false;
 
-    const connectAccountSocket = async () => {
-      try {
-        setIsAuthorizing(true);
-        setAuthError(null);
+    setIsAuthorizing(true);
+    setAuthError(null);
 
-        const accountId = activeAccountLogin.trim();
-        const selectedOAuthAccount = oauthAccounts.find(
-          (acct) => acct.account === accountId,
-        );
+    const wsUrl = `wss://ws.derivws.com/websockets/v3?app_id=${encodeURIComponent(effectiveAppId)}`;
 
-        if (!accountId) {
-          throw new Error('No active Deriv account is selected.');
-        }
+    try {
+      ws = new WebSocket(wsUrl);
+      accountSocketRef.current = ws;
 
-        if (!selectedOAuthAccount) {
-          throw new Error('The selected Deriv account is no longer available. Please authorize again.');
-        }
-
-        console.log('Requesting Deriv authenticated WebSocket for:', {
-          account: accountId,
-          isVirtual: selectedOAuthAccount.isVirtual,
-          currency: selectedOAuthAccount.currency,
-        });
-
-        const otpResponse = await fetch('/api/deriv/options/otp', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            accountId,
-            token: token.trim(),
-          }),
-        });
-
-        const otpData = await otpResponse.json().catch(() => ({}));
-
-        if (!otpResponse.ok) {
-          throw new Error(
-            otpData?.error ||
-              'Failed to obtain Deriv WebSocket authentication',
-          );
-        }
-
-        const wsUrl = otpData?.url;
-        if (!wsUrl) {
-          throw new Error('Deriv did not return a WebSocket URL.');
-        }
-
+      ws.onopen = () => {
         if (isCancelled) return;
+        // Authorize with token
+        ws?.send(JSON.stringify({ authorize: token.trim() }));
 
-        ws = new WebSocket(wsUrl);
-        accountSocketRef.current = ws;
+        // Deriv closes idle connections after ~2 minutes; keep-alive every 25s
+        pingInterval = window.setInterval(() => {
+          if (ws?.readyState === WebSocket.OPEN) {
+            ws.send(JSON.stringify({ ping: 1 }));
+          }
+        }, 25000);
+      };
 
-        ws.onopen = () => {
-          if (isCancelled) return;
+      ws.onmessage = (event) => {
+        if (isCancelled) return;
+        try {
+          const data = JSON.parse(event.data);
 
-          console.log('Deriv authenticated account WebSocket connected.');
-          setIsAuthorizing(true);
+          if (data.error) {
+            console.error(`Deriv Account Error [${data.error.code}]: ${data.error.message}`);
+            setAuthError(`[${data.error.code}]: ${data.error.message}`);
+            setIsAuthorizing(false);
+            return;
+          }
 
-          ws?.send(
-            JSON.stringify({
-              balance: 1,
-              subscribe: 1,
-              req_id: 1,
-            }),
-          );
-
-          pingInterval = window.setInterval(() => {
-            if (ws?.readyState === WebSocket.OPEN) {
-              ws.send(JSON.stringify({ ping: 1, req_id: 2 }));
-            }
-          }, 25000);
-        };
-
-        ws.onmessage = (event) => {
-          if (isCancelled) return;
-
-          try {
-            const data = JSON.parse(event.data);
-
-            if (data.error) {
-              const message =
-                data.error.message || 'Deriv account connection error';
-              console.error(
-                `Deriv Account Error [${data.error.code || 'UNKNOWN'}]: ${message}`,
-              );
-              setAuthError(
-                `[${data.error.code || 'ERROR'}]: ${message}`,
-              );
-              setIsAuthorizing(false);
-              return;
-            }
-
-            if (data.msg_type !== 'balance' || !data.balance) {
-              return;
-            }
-
-            const balanceData = data.balance;
-            const loginid = String(
-              balanceData.loginid || accountId,
-            ).trim();
-
-            // Never allow a balance response for another account to overwrite
-            // the account currently selected in the UI.
-            if (loginid && loginid !== accountId) {
-              console.warn('Ignoring balance for unexpected Deriv account:', {
-                received: loginid,
-                selected: accountId,
-              });
-              return;
-            }
-
-            const newBal = Number(balanceData.balance ?? 0);
-            const cur = balanceData.currency || selectedOAuthAccount.currency || 'USD';
-            const isVirt = Boolean(selectedOAuthAccount.isVirtual);
+          if (data.msg_type === 'authorize' || data.authorize) {
+            const auth = data.authorize;
+            const isVirtual = Boolean(auth.is_virtual);
+            const bal = Number(auth.balance ?? 0);
+            const cur = auth.currency || 'USD';
 
             const profile: DerivAccountProfile = {
-              loginid: accountId,
-              fullname: accountProfile?.fullname,
-              email: accountProfile?.email,
+              loginid: auth.loginid,
+              fullname: auth.fullname,
+              email: auth.email,
               currency: cur,
-              balance: newBal,
-              isVirtual: isVirt,
+              balance: bal,
+              isVirtual,
             };
 
             setAccountProfile(profile);
-            setIsRealAccount(!isVirt);
-
-            if (isVirt) {
-              setVirtualAccount({
-                loginid: accountId,
-                balance: newBal,
-                currency: cur,
-              });
-              // Clear the other account so stale real data can never appear
-              // while a demo account is selected.
-              setRealAccount(null);
-            } else {
-              setRealAccount({
-                loginid: accountId,
-                balance: newBal,
-                currency: cur,
-              });
-              // Clear the other account so stale demo data can never appear
-              // while a real account is selected.
-              setVirtualAccount(null);
-            }
-
             setIsAuthorizing(false);
             setAuthError(null);
 
-            console.log('Deriv balance:', {
-              account: accountId,
-              type: isVirt ? 'DEMO' : 'REAL',
-              balance: newBal,
-              currency: cur,
-            });
-          } catch (error) {
-            console.error('Failed to process Deriv account message:', error);
+            if (isVirtual) {
+              setVirtualAccount({ loginid: auth.loginid, balance: bal, currency: cur });
+            } else {
+              setRealAccount({ loginid: auth.loginid, balance: bal, currency: cur });
+            }
+
+            // Subscribe to real-time balance stream
+            ws?.send(JSON.stringify({ balance: 1, subscribe: 1 }));
           }
-        };
 
-        ws.onerror = (error) => {
-          if (isCancelled) return;
-          console.error('Deriv account WebSocket error:', error);
-          setAuthError('Deriv account WebSocket connection failed.');
+          if (data.msg_type === 'balance' || data.balance) {
+            const b = data.balance;
+            const newBal = Number(b.balance);
+            const cur = b.currency || 'USD';
+
+            setAccountProfile((prev) => (prev ? { ...prev, balance: newBal, currency: cur } : null));
+
+            const isVirt = b.loginid?.startsWith('VR') || accountProfile?.isVirtual;
+            if (isVirt) {
+              setVirtualAccount((prev) => (prev ? { ...prev, balance: newBal, currency: cur } : { loginid: b.loginid || 'VRTC', balance: newBal, currency: cur }));
+            } else {
+              setRealAccount((prev) => (prev ? { ...prev, balance: newBal, currency: cur } : { loginid: b.loginid || 'Real', balance: newBal, currency: cur }));
+            }
+          }
+        } catch {
+          // ignore parsing error
+        }
+      };
+
+      ws.onerror = (err) => {
+        if (!isCancelled) {
+          console.error('Deriv account socket error:', err);
           setIsAuthorizing(false);
-        };
+        }
+      };
 
-        ws.onclose = () => {
-          if (isCancelled) return;
-          console.log('Deriv authenticated account WebSocket closed.');
+      ws.onclose = () => {
+        if (!isCancelled) {
           setIsAuthorizing(false);
-        };
-      } catch (error) {
-        if (isCancelled) return;
-
-        console.error('Deriv account connection failed:', error);
-        setAuthError(
-          error instanceof Error
-            ? error.message
-            : 'Failed to connect to Deriv account.',
-        );
-        setIsAuthorizing(false);
-      }
-    };
-
-    void connectAccountSocket();
+        }
+      };
+    } catch (err: any) {
+      setAuthError(err?.message || 'Failed to connect to Deriv');
+      setIsAuthorizing(false);
+    }
 
     return () => {
       isCancelled = true;
-
-      if (pingInterval !== undefined) {
-        window.clearInterval(pingInterval);
-      }
-
+      if (pingInterval) clearInterval(pingInterval);
       if (ws) {
         ws.close();
       }
-
-      if (accountSocketRef.current === ws) {
-        accountSocketRef.current = null;
-      }
     };
-  }, [token, activeAccountLogin, oauthAccounts]);
+  }, [token, effectiveAppId, oauthAccounts.length]);
 
   // Connect to Deriv Public WebSocket
   useEffect(() => {
@@ -1560,29 +1493,17 @@ export function MarketMindApp() {
     };
   }, [signalMode, strategySignal, activeSignalType, ticks, digitStats, activeMarket.displayName]);
 
-  // Current balance to display.
-  // Once OAuth is connected, never fall back to the old mock demo balance.
-  // The selected OAuth account's isVirtual flag determines which live balance
-  // belongs in the header.
-  const activeOAuthAccount = oauthAccounts.find(
-    (acct) => acct.account === activeAccountLogin,
-  );
+  // Current balance to display. For OAuth2, balance belongs to the
+  // selected account returned by GET /trading/v1/options/accounts.
+  const activeOAuthAccount = oauthAccounts.find((acct) => acct.account === activeAccountLogin);
+  const currentBalance = activeOAuthAccount && typeof activeOAuthAccount.balance === 'number'
+    ? activeOAuthAccount.balance
+    : isRealAccount
+      ? (realAccount ? realAccount.balance : 0.0)
+      : (virtualAccount ? virtualAccount.balance : demoBalance);
 
-  const activeIsVirtual =
-    activeOAuthAccount?.isVirtual ??
-    accountProfile?.isVirtual ??
-    !isRealAccount;
-
-  const currentBalance =
-    token && activeOAuthAccount
-      ? activeIsVirtual
-        ? (virtualAccount?.balance ?? 0)
-        : (realAccount?.balance ?? 0)
-      : demoBalance;
-
-  const currentCurrency = activeIsVirtual
-    ? (virtualAccount?.currency ?? activeOAuthAccount?.currency ?? 'USD')
-    : (realAccount?.currency ?? activeOAuthAccount?.currency ?? 'USD');
+  const currentCurrency = activeOAuthAccount?.currency
+    || (isRealAccount ? (realAccount?.currency || 'USD') : (virtualAccount?.currency || 'USD'));
 
   // Strategy preset selector logic
   const applyStrategyPreset = (stratId: string) => {
@@ -2180,55 +2101,43 @@ export function MarketMindApp() {
     }
   };
 
-  const handleSelectOAuthAccount = (acct: DerivOAuthAccount) => {
-    console.log('Switching Deriv account:', {
-      account: acct.account,
-      isVirtual: acct.isVirtual,
-      currency: acct.currency,
-    });
-
-    // Clear both live balances before reconnecting. This prevents the previous
-    // account's balance from being displayed during the switch.
-    setAccountProfile(null);
-    setRealAccount(null);
-    setVirtualAccount(null);
+  const handleSelectOAuthAccount = (acct: OAuthAccountWithBalance) => {
+    const balance = Number(acct.balance ?? 0);
 
     setActiveAccountLogin(acct.account);
     setActiveAccountLoginId(acct.account);
-    setIsRealAccount(!acct.isVirtual);
     setToken(acct.token);
     setTokenInput(acct.token);
     saveStoredToken(acct.token);
+    setIsRealAccount(!acct.isVirtual);
+    setAccountProfile({
+      loginid: acct.account,
+      currency: acct.currency,
+      balance,
+      isVirtual: acct.isVirtual,
+    });
 
-    console.log(
-      `Selected ${acct.isVirtual ? 'DEMO' : 'REAL'} account: ${acct.account}`,
-    );
-  };;
+    if (acct.isVirtual) {
+      setVirtualAccount({ loginid: acct.account, balance, currency: acct.currency });
+      setRealAccount(null);
+    } else {
+      setRealAccount({ loginid: acct.account, balance, currency: acct.currency });
+      setVirtualAccount(null);
+    }
+  };
 
   const handleToggleRealDemo = (targetReal: boolean) => {
-    if (targetReal) {
-      const realAcct = oauthAccounts.find((a) => !a.isVirtual);
-      if (realAcct && realAcct.token !== token) {
-        setActiveAccountLogin(realAcct.account);
-        setActiveAccountLoginId(realAcct.account);
-        setToken(realAcct.token);
-        setTokenInput(realAcct.token);
-        saveStoredToken(realAcct.token);
-      }
-      setIsRealAccount(true);
-      if (!token && !realAcct) {
-        setTokenModalOpen(true);
-      }
-    } else {
-      const virtAcct = oauthAccounts.find((a) => a.isVirtual);
-      if (virtAcct && virtAcct.token !== token) {
-        setActiveAccountLogin(virtAcct.account);
-        setActiveAccountLoginId(virtAcct.account);
-        setToken(virtAcct.token);
-        setTokenInput(virtAcct.token);
-        saveStoredToken(virtAcct.token);
-      }
-      setIsRealAccount(false);
+    const selected = oauthAccounts.find((acct) => acct.isVirtual !== targetReal);
+
+    if (selected) {
+      handleSelectOAuthAccount(selected);
+      return;
+    }
+
+    setIsRealAccount(targetReal);
+
+    if (!token && !selected) {
+      setTokenModalOpen(true);
     }
   };
 
@@ -2359,9 +2268,9 @@ export function MarketMindApp() {
             </div>
             <div className="balance-figure">
               <span className="balance-label">
-                {activeIsVirtual
-                  ? (virtualAccount ? virtualAccount.loginid : 'Demo Balance')
-                  : (realAccount ? realAccount.loginid : 'Real Balance')}
+                {isRealAccount
+                  ? (realAccount ? realAccount.loginid : 'Real Balance')
+                  : (virtualAccount ? virtualAccount.loginid : 'Demo Balance')}
               </span>
               <span className="balance-amount">
                 <span className="cur">{currentCurrency}</span>
@@ -4053,7 +3962,7 @@ export function MarketMindApp() {
                       aria-readonly="true"
                     />
                     <span className="risk-note">
-                      {activeIsVirtual ? 'From Deriv Demo' : 'From Deriv Real'}
+                      {isRealAccount ? 'From Deriv Real' : 'Demo virtual'}
                     </span>
                   </span>
                 </label>
@@ -4475,7 +4384,7 @@ export function MarketMindApp() {
                       </span>
                     </div>
                     <span className="rounded-md border border-emerald-500/40 bg-emerald-500/10 px-2 py-0.5 font-mono text-[11px] font-semibold text-emerald-300">
-                      {activeIsVirtual ? 'Demo Account' : 'Real Account'}
+                      {(accountProfile?.isVirtual ?? isRealAccount === false) ? 'Demo Account' : 'Real Account'}
                     </span>
                   </div>
 
