@@ -629,6 +629,93 @@ export function MarketMindApp() {
 
   const effectiveAppId = (customAppId || config?.publicAppId || DEFAULT_DERIV_APP_ID).trim();
 
+  // Fetch fresh Demo/Real Options account balances from Deriv.
+  // OAuth access tokens identify the user; the account_id selects which
+  // Options account the UI is currently displaying.
+  const refreshOAuthAccounts = async (preferredAccountId?: string) => {
+    const bearer = token.trim();
+    if (!bearer) return;
+
+    try {
+      const response = await fetch('/api/deriv/accounts', {
+        method: 'GET',
+        headers: {
+          Authorization: `Bearer ${bearer}`,
+        },
+        cache: 'no-store',
+      });
+
+      const data = await response.json().catch(() => ({}));
+      if (!response.ok) {
+        throw new Error(
+          data?.error_description || data?.error || `Account refresh failed (${response.status})`,
+        );
+      }
+
+      const rawFreshAccounts = Array.isArray(data?.accounts)
+        ? (data.accounts as Array<Omit<OAuthAccountWithBalance, 'token'> & { token?: string }>)
+        : [];
+
+      if (rawFreshAccounts.length === 0) return;
+
+      // The refresh endpoint intentionally does not return the OAuth token.
+      // Preserve the token already held in browser state for each account.
+      const freshAccounts: OAuthAccountWithBalance[] = rawFreshAccounts.map((acct) => {
+        const existing = oauthAccounts.find((item) => item.account === acct.account);
+        return {
+          ...acct,
+          token: acct.token || existing?.token || bearer,
+        };
+      });
+
+      saveStoredAccounts(freshAccounts);
+      setOauthAccounts(freshAccounts);
+
+      const desiredId = preferredAccountId || activeAccountLogin;
+      const selected =
+        freshAccounts.find((acct) => acct.account === desiredId) || freshAccounts[0];
+
+      if (!selected) return;
+
+      const balance = Number(selected.balance ?? 0);
+      const virtual = Boolean(selected.isVirtual);
+
+      setActiveAccountLogin(selected.account);
+      setActiveAccountLoginId(selected.account);
+      setIsRealAccount(!virtual);
+      setAccountProfile((prev) => ({
+        ...(prev || {}),
+        loginid: selected.account,
+        currency: selected.currency,
+        balance,
+        isVirtual: virtual,
+      }));
+
+      if (virtual) {
+        setVirtualAccount({
+          loginid: selected.account,
+          balance,
+          currency: selected.currency,
+        });
+      } else {
+        setRealAccount({
+          loginid: selected.account,
+          balance,
+          currency: selected.currency,
+        });
+      }
+    } catch (error) {
+      console.error('Failed to refresh Deriv Options accounts:', error);
+    }
+  };
+
+  // Stored OAuth balances can be stale. Refresh them whenever an OAuth token
+  // is available, including after a page reload and after OAuth login.
+  useEffect(() => {
+    if (!token.trim()) return;
+    void refreshOAuthAccounts();
+  }, [token]);
+
   // Deriv Live WebSocket & Ticks
   const [ticks, setTicks] = useState<Tick[]>(() => generateSeedTicks(ALL_MARKETS[4], 120));
   const [isWsLive, setIsWsLive] = useState<boolean>(false);
@@ -2124,6 +2211,10 @@ export function MarketMindApp() {
       setRealAccount({ loginid: acct.account, balance, currency: acct.currency });
       setVirtualAccount(null);
     }
+
+    // Immediately refresh the selected account so the displayed balance is
+    // not taken from an old OAuth/localStorage snapshot.
+    void refreshOAuthAccounts(acct.account);
   };
 
   const handleToggleRealDemo = (targetReal: boolean) => {
