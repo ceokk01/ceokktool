@@ -2,6 +2,20 @@ import type { VercelRequest, VercelResponse } from '@vercel/node';
 
 const DERIV_OTP_BASE = 'https://api.derivws.com/trading/v1/options/accounts';
 
+interface DerivOptionsOtpPayload {
+  data?: {
+    url?: string;
+    otp?: string;
+  };
+  errors?: Array<{
+    status?: number;
+    code?: string;
+    message?: string;
+  }>;
+  message?: string;
+  error?: string;
+}
+
 export default async function handler(req: VercelRequest, res: VercelResponse) {
   if (req.method !== 'POST') {
     return res.status(405).json({
@@ -38,7 +52,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       },
     );
 
-    const data = await response.json().catch(() => ({}));
+    const data = (await response.json().catch(() => ({}))) as DerivOptionsOtpPayload;
 
     if (!response.ok) {
       console.error('Deriv Options OTP request failed:', {

@@ -14,6 +14,14 @@ type RawAccount = {
   is_virtual?: boolean;
 };
 
+interface DerivAccountsPayload {
+  message?: string;
+  error?: string;
+  errors?: Array<{ message?: string; code?: string }>;
+  data?: RawAccount[];
+  accounts?: RawAccount[];
+}
+
 export default async function handler(req: VercelRequest, res: VercelResponse) {
   if (req.method !== 'GET') {
     return res.status(405).json({
@@ -40,7 +48,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       cache: 'no-store',
     });
 
-    const data = await response.json().catch(() => ({}));
+    const data = (await response.json().catch(() => ({}))) as DerivAccountsPayload;
 
     if (!response.ok) {
       return res.status(response.status).json({
