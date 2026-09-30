@@ -200,222 +200,7 @@ export interface BotConfig {
   stopLoss: string;
 }
 
-const INITIAL_BOTS: BotConfig[] = [
-  {
-    id: 'bot-over-1',
-    name: 'over 1 with over 3 recovery',
-    running: true,
-    stake: '0.35',
-    martingale: '2.0',
-    market: 'Volatility 100 Index',
-    contractType: 'Over',
-    targetDigit: 1,
-    strategyId: 'over-1',
-    strategyName: 'Over Digit 1 Strategy',
-    category: 'Deriv Strategies 2',
-    entryRule: 'Digits 0 & 1 < 10% (one red arc), 3+ digits (2-9) >= 11%, last 20 win rate >= 90%',
-    exitRule: 'Stop if 2 consecutive digits <= 1 appear or profit target reached',
-    recoveryRule: 'Over 3 Recovery: trade Over 3 with 2.0x Martingale upon loss',
-    targetRuns: 5,
-    takeProfit: '25.00',
-    stopLoss: '10.00',
-  },
-  {
-    id: 'bot-02r43',
-    name: '02R43 pro',
-    running: true,
-    stake: '0.50',
-    martingale: '1.8',
-    market: 'Volatility 75 Index',
-    contractType: 'Over',
-    targetDigit: 2,
-    strategyId: 'over-2',
-    strategyName: 'Over Digit 2 Strategy',
-    category: 'Deriv Strategies 2',
-    entryRule: 'Digits 0, 1, 2 < 10% (one red arc), 3+ digits (3-9) >= 11%, last 20 win rate >= 78%',
-    exitRule: 'Stop after 4 consecutive wins or stop loss triggered',
-    recoveryRule: '02R43 Protocol: Recover on Over 4 or Over 3 with 1.8x multiplier',
-    targetRuns: 4,
-    takeProfit: '30.00',
-    stopLoss: '12.00',
-  },
-  {
-    id: 'bot-under-8',
-    name: 'under 8 with under 6 recovery',
-    running: false,
-    stake: '0.35',
-    martingale: '2.0',
-    market: 'Volatility 100 (1s) Index',
-    contractType: 'Under',
-    targetDigit: 8,
-    strategyId: 'under-8',
-    strategyName: 'Under Digit 8 Strategy',
-    category: 'Deriv Strategies 2',
-    entryRule: 'Wait for 1+ OVER (O) digits, enter immediately after the first UNDER (U) appears',
-    exitRule: 'Stop if 2 consecutive digits >= 8 appear',
-    recoveryRule: 'Under 6 Recovery: trade Under 6 with 2.0x Martingale upon loss',
-    targetRuns: 5,
-    takeProfit: '25.00',
-    stopLoss: '10.00',
-  },
-  {
-    id: 'bot-u7r56',
-    name: 'U7R56 pro',
-    running: false,
-    stake: '0.50',
-    martingale: '2.0',
-    market: 'Volatility 50 (1s) Index',
-    contractType: 'Under',
-    targetDigit: 7,
-    strategyId: 'under-7',
-    strategyName: 'Under Digit 7 Strategy',
-    category: 'Deriv Strategies 2',
-    entryRule: 'Wait for 1+ OVER (O) digits, enter immediately after the first UNDER (U) appears',
-    exitRule: 'Stop after 4 consecutive wins or stop loss reached',
-    recoveryRule: 'U7R56 Protocol: Recover on Under 5 or Under 6 with 2.0x multiplier',
-    targetRuns: 4,
-    takeProfit: '30.00',
-    stopLoss: '12.00',
-  },
-  {
-    id: 'bot-cmv-pro',
-    name: 'CMV pro',
-    running: false,
-    stake: '0.50',
-    martingale: '2.0',
-    market: 'Volatility 100 Index',
-    contractType: 'Over',
-    targetDigit: 1,
-    strategyId: 'cmv-pro',
-    strategyName: 'Compound Martingale Volatility',
-    category: 'Deriv Strategies 2',
-    entryRule: 'Dynamically routes to highest win rate setup (Over 1/2 vs Under 7/8)',
-    exitRule: 'Compound winning profits; stop after 4-5 consecutive wins',
-    recoveryRule: 'Adaptive step recovery with R43 / R56 fallback',
-    targetRuns: 5,
-    takeProfit: '40.00',
-    stopLoss: '15.00',
-  },
-  {
-    id: 'bot-hit-run',
-    name: 'Hit & run (entry point: 0)',
-    running: false,
-    stake: '1.00',
-    martingale: '1.0',
-    market: 'Volatility 25 (1s) Index',
-    contractType: 'Over',
-    targetDigit: 1,
-    strategyId: 'hit-run',
-    strategyName: 'Hit & Run Entry Point',
-    category: 'Deriv Strategies 2',
-    entryRule: 'Entry point 0: Fires immediately when last digit is 0 for Over 1',
-    exitRule: 'Takes 1 to 2 runs max then locks profits and stops',
-    recoveryRule: 'Zero Martingale: 1-hit stop loss to protect bankroll',
-    targetRuns: 2,
-    takeProfit: '10.00',
-    stopLoss: '5.00',
-  },
-  {
-    id: 'bot-strat-3',
-    name: 'MACD Trend Hunter',
-    running: false,
-    stake: '0.50',
-    martingale: '2.0',
-    market: 'Volatility 75 Index',
-    contractType: 'Over',
-    targetDigit: 4,
-    strategyId: 'strategy-3',
-    strategyName: 'Over/Under Strategy 3 (MACD)',
-    category: 'Indicators',
-    entryRule: 'Trade OVER 3/4 on clean uptrend (MACD >= +1) with Green Arc; UNDER 5/6/7 on downtrend (MACD <= -1)',
-    exitRule: 'Exit when MACD line crosses zero or reversal detected',
-    recoveryRule: '2.0x Martingale on digits 3, 4, 5, 6',
-    targetRuns: 4,
-    takeProfit: '25.00',
-    stopLoss: '10.00',
-  },
-  {
-    id: 'bot-strat-4',
-    name: 'Donchian Breakout O/U',
-    running: false,
-    stake: '0.50',
-    martingale: '2.0',
-    market: 'Volatility 50 Index',
-    contractType: 'Under',
-    targetDigit: 6,
-    strategyId: 'strategy-4',
-    strategyName: 'Over/Under Strategy 4 (Donchian)',
-    category: 'Indicators',
-    entryRule: 'Red candle retest on Support or Doji -> Under 6; Green rising above Middle line -> Over 4',
-    exitRule: 'Exit on channel opposite boundary touch',
-    recoveryRule: '2.0x Martingale for max 2 steps',
-    targetRuns: 4,
-    takeProfit: '25.00',
-    stopLoss: '10.00',
-  },
-  {
-    id: 'bot-strat-5',
-    name: 'Smoothed MA Under 6',
-    running: false,
-    stake: '0.35',
-    martingale: '2.0',
-    market: 'Volatility 100 (1s) Index',
-    contractType: 'Under',
-    targetDigit: 6,
-    strategyId: 'strategy-5',
-    strategyName: 'Over/Under Strategy 5 (Smoothed MA)',
-    category: 'Indicators',
-    entryRule: 'Enter UNDER 6 immediately after the 2 Smoothed MA lines meet/cross',
-    exitRule: 'Stop when lines diverge beyond 0.05%',
-    recoveryRule: 'Single-step 2.0x Martingale then pause',
-    targetRuns: 4,
-    takeProfit: '20.00',
-    stopLoss: '8.00',
-  },
-  {
-    id: 'bot-strat-6',
-    name: 'ADX Trend Over 4/6',
-    running: false,
-    stake: '0.50',
-    martingale: '2.0',
-    market: 'Volatility 100 Index',
-    contractType: 'Over',
-    targetDigit: 4,
-    strategyId: 'strategy-6',
-    strategyName: 'Over/Under Strategy 6 (MA + ADX)',
-    category: 'Indicators',
-    entryRule: '1m TF: White bottom, Red/Green ordered (25+) -> Over 4. Candle MA rejection -> Over 6',
-    exitRule: 'Exit immediately if white line enters middle of green and red',
-    recoveryRule: 'Switch to Over 3 on loss. Avoid trading if white in middle',
-    targetRuns: 4,
-    takeProfit: '30.00',
-    stopLoss: '12.00',
-  },
-  {
-    id: 'bot-even-sniper',
-    name: 'Even Sniper v2',
-    running: false,
-    stake: '0.35',
-    martingale: '2.0',
-    market: 'Volatility 100 Index',
-    contractType: 'Even',
-    category: 'General',
-    takeProfit: '25.00',
-    stopLoss: '10.00',
-  },
-  {
-    id: 'bot-rise-follower',
-    name: 'Rise Follower',
-    running: false,
-    stake: '1.00',
-    martingale: '2.2',
-    market: 'Volatility 50 Index',
-    contractType: 'Rise',
-    category: 'General',
-    takeProfit: '20.00',
-    stopLoss: '8.00',
-  },
-];
+const INITIAL_BOTS: BotConfig[] = [];
 
 const SIGNAL_TYPES = [
   'Rise',
@@ -2171,18 +1956,34 @@ export function MarketMindApp() {
 
   // Send to Bots action
   const handleSendToBots = () => {
-    setBots((prev) =>
-      prev.map((bot, idx) =>
+    setBots((prev) => {
+      if (prev.length === 0) {
+        return [
+          {
+            id: `bot-${Date.now()}`,
+            name: botToUseInput || 'Active Signal Bot',
+            market: activeMarket.displayName,
+            contractType: (activeSignalType as any) || 'Over',
+            running: false,
+            stake: '0.35',
+            martingale: '2.0',
+            takeProfit: '25.00',
+            stopLoss: '10.00',
+            category: 'Deriv Strategies 2',
+          },
+        ];
+      }
+      return prev.map((bot, idx) =>
         idx === 0
           ? {
               ...bot,
               name: botToUseInput,
               market: activeMarket.displayName,
-              contractType: activeSignalType,
+              contractType: activeSignalType as any,
             }
           : bot
-      )
-    );
+      );
+    });
     setActiveTab('bots');
   };
 
@@ -3737,240 +3538,291 @@ export function MarketMindApp() {
                 </button>
               </div>
 
-              <div className="bot-grid">
-                {bots
-                  .filter((bot) => {
-                    if (botCategoryFilter === 'Running') return bot.running;
-                    if (botCategoryFilter === 'Deriv Strategies 2') return bot.category === 'Deriv Strategies 2';
-                    if (botCategoryFilter === 'Indicators') return bot.category === 'Indicators';
-                    return true;
-                  })
-                  .map((bot) => {
-                    const isOver = bot.contractType === 'Over';
-                    const isUnder = bot.contractType === 'Under';
-                    const targetDig = bot.targetDigit ?? (isUnder ? 7 : isOver ? 1 : 2);
+              {bots.length === 0 ? (
+                <div className="p-10 text-center border border-dashed border-[var(--line-soft)] rounded-xl bg-[var(--surface)] my-6 flex flex-col items-center justify-center max-w-xl mx-auto shadow-sm">
+                  <div className="w-14 h-14 rounded-2xl bg-accent/10 border border-accent/20 flex items-center justify-center text-accent mb-4">
+                    <Bot size={28} />
+                  </div>
+                  <h2 className="text-lg font-bold text-text mb-2">No Active Bots Configured</h2>
+                  <p className="text-xs text-text-3 mb-6 max-w-md leading-relaxed">
+                    All default bots have been cleared. You can now add active strategy bots configured to execute trades automatically on your Real or Demo Deriv account.
+                  </p>
+                  <div className="flex flex-wrap items-center justify-center gap-3">
+                    <button
+                      type="button"
+                      className="btn btn-primary"
+                      onClick={handleOpenNewBotModal}
+                    >
+                      <Plus size={15} />
+                      Create New Strategy Bot
+                    </button>
+                    <button
+                      type="button"
+                      className="btn btn-outline"
+                      onClick={() => {
+                        const newBot: BotConfig = {
+                          id: `bot-${Date.now()}`,
+                          name: 'Over 1 with Over 3 Recovery',
+                          market: activeMarket.displayName,
+                          contractType: 'Over',
+                          targetDigit: 1,
+                          strategyId: 'over-1',
+                          strategyName: 'Over Digit 1 Strategy',
+                          category: 'Deriv Strategies 2',
+                          entryRule: 'Digits 0 & 1 < 10% (one red arc), 3+ digits (2-9) >= 11%, last 20 win rate >= 90%',
+                          exitRule: 'Stop if 2 consecutive digits <= 1 appear or profit target reached',
+                          recoveryRule: 'Over 3 Recovery: trade Over 3 with 2.0x Martingale upon loss',
+                          targetRuns: 5,
+                          stake: '0.35',
+                          martingale: '2.0',
+                          takeProfit: '25.00',
+                          stopLoss: '10.00',
+                          running: false,
+                        };
+                        setBots([newBot]);
+                        setBotRunToast('Added Over 1 Active Strategy Bot!');
+                        setTimeout(() => setBotRunToast(null), 3000);
+                      }}
+                    >
+                      <Zap size={14} className="text-accent" />
+                      Quick Add Over 1 Bot
+                    </button>
+                  </div>
+                </div>
+              ) : (
+                <div className="bot-grid">
+                  {bots
+                    .filter((bot) => {
+                      if (botCategoryFilter === 'Running') return bot.running;
+                      if (botCategoryFilter === 'Deriv Strategies 2') return bot.category === 'Deriv Strategies 2';
+                      if (botCategoryFilter === 'Indicators') return bot.category === 'Indicators';
+                      return true;
+                    })
+                    .map((bot) => {
+                      const isOver = bot.contractType === 'Over';
+                      const isUnder = bot.contractType === 'Under';
+                      const targetDig = bot.targetDigit ?? (isUnder ? 7 : isOver ? 1 : 2);
 
-                    return (
-                      <article key={bot.id} className={`bot ${bot.running ? 'is-running' : ''}`}>
-                        <div className="bot-head">
-                          <input
-                            type="text"
-                            value={bot.name}
-                            onChange={(e) => {
-                              const val = e.target.value;
-                              setBots((prev) => prev.map((b) => (b.id === bot.id ? { ...b, name: val } : b)));
-                            }}
-                            aria-label="Name of the bot"
-                          />
-                          <span className="bot-state">
-                            <i></i>
-                            {bot.running ? 'Running' : 'Idle'}
-                          </span>
-                        </div>
+                      return (
+                        <article key={bot.id} className={`bot ${bot.running ? 'is-running' : ''}`}>
+                          <div className="bot-head">
+                            <input
+                              type="text"
+                              value={bot.name}
+                              onChange={(e) => {
+                                const val = e.target.value;
+                                setBots((prev) => prev.map((b) => (b.id === bot.id ? { ...b, name: val } : b)));
+                              }}
+                              aria-label="Name of the bot"
+                            />
+                            <span className="bot-state">
+                              <i></i>
+                              {bot.running ? 'Running' : 'Idle'}
+                            </span>
+                          </div>
 
-                        {/* Badges & Tags */}
-                        <div className="bot-tag-row">
-                          {bot.category && (
-                            <span className="bot-tag bot-tag-cat">
-                              {bot.category}
-                            </span>
-                          )}
-                          {(isOver || isUnder) && (
-                            <span className={`bot-tag ${isOver ? 'bot-tag-over' : 'bot-tag-under'}`}>
-                              {isOver ? '↑' : '↓'} Target: {bot.contractType.toUpperCase()} {targetDig}
-                            </span>
-                          )}
-                          {bot.targetRuns && (
-                            <span className="bot-tag bot-tag-runs">
-                              {bot.targetRuns} runs target
-                            </span>
-                          )}
-                        </div>
-
-                        {/* Strategy Rules Preview */}
-                        {(bot.entryRule || bot.recoveryRule) && (
-                          <div className="bot-rules-box">
-                            {bot.entryRule && (
-                              <div className="bot-rule-line">
-                                <span className="bot-rule-label text-live">Entry:</span>
-                                <span className="line-clamp-2">{bot.entryRule}</span>
-                              </div>
+                          {/* Badges & Tags */}
+                          <div className="bot-tag-row">
+                            {bot.category && (
+                              <span className="bot-tag bot-tag-cat">
+                                {bot.category}
+                              </span>
                             )}
-                            {bot.recoveryRule && (
-                              <div className="bot-rule-line">
-                                <span className="bot-rule-label text-fall">Recovery:</span>
-                                <span className="line-clamp-2">{bot.recoveryRule}</span>
-                              </div>
+                            {(isOver || isUnder) && (
+                              <span className={`bot-tag ${isOver ? 'bot-tag-over' : 'bot-tag-under'}`}>
+                                {isOver ? '↑' : '↓'} Target: {bot.contractType.toUpperCase()} {targetDig}
+                              </span>
+                            )}
+                            {bot.targetRuns && (
+                              <span className="bot-tag bot-tag-runs">
+                                {bot.targetRuns} runs target
+                              </span>
                             )}
                           </div>
-                        )}
 
-                        <div className="bot-fields">
-                          <label>
-                            Stake ($)
-                            <input
-                              type="text"
-                              className="mmp-input"
-                              value={bot.stake}
-                              onChange={(e) => {
-                                const val = e.target.value;
-                                setBots((prev) => prev.map((b) => (b.id === bot.id ? { ...b, stake: val } : b)));
-                              }}
-                              inputMode="decimal"
-                            />
-                          </label>
-                          <label>
-                            Martingale Factor
-                            <input
-                              type="text"
-                              className="mmp-input"
-                              value={bot.martingale}
-                              onChange={(e) => {
-                                const val = e.target.value;
-                                setBots((prev) => prev.map((b) => (b.id === bot.id ? { ...b, martingale: val } : b)));
-                              }}
-                              inputMode="decimal"
-                            />
-                          </label>
-                          <label>
-                            Market
-                            <select
-                              className="mmp-select"
-                              value={bot.market}
-                              onChange={(e) => {
-                                const val = e.target.value;
-                                setBots((prev) => prev.map((b) => (b.id === bot.id ? { ...b, market: val } : b)));
-                              }}
-                            >
-                              {MARKET_GROUPS.map((group) => (
-                                <optgroup key={group.group} label={group.group}>
-                                  {group.items.map((item) => (
-                                    <option key={item.symbol} value={item.displayName}>
-                                      {item.displayName}
-                                    </option>
-                                  ))}
-                                </optgroup>
-                              ))}
-                            </select>
-                          </label>
-                          <label>
-                            Contract Type
-                            <select
-                              className="mmp-select"
-                              value={bot.contractType}
-                              onChange={(e) => {
-                                const val = e.target.value as ContractType;
-                                setBots((prev) => prev.map((b) => (b.id === bot.id ? { ...b, contractType: val } : b)));
-                              }}
-                            >
-                              <option>Even</option>
-                              <option>Odd</option>
-                              <option>Rise</option>
-                              <option>Fall</option>
-                              <option>Over</option>
-                              <option>Under</option>
-                              <option>Accumulators</option>
-                            </select>
-                          </label>
+                          {/* Strategy Rules Preview */}
+                          {(bot.entryRule || bot.recoveryRule) && (
+                            <div className="bot-rules-box">
+                              {bot.entryRule && (
+                                <div className="bot-rule-line">
+                                  <span className="bot-rule-label text-live">Entry:</span>
+                                  <span className="line-clamp-2">{bot.entryRule}</span>
+                                </div>
+                              )}
+                              {bot.recoveryRule && (
+                                <div className="bot-rule-line">
+                                  <span className="bot-rule-label text-fall">Recovery:</span>
+                                  <span className="line-clamp-2">{bot.recoveryRule}</span>
+                                </div>
+                              )}
+                            </div>
+                          )}
 
-                          {(isOver || isUnder) && (
+                          <div className="bot-fields">
                             <label>
-                              Target Barrier Digit
+                              Stake ($)
+                              <input
+                                type="text"
+                                className="mmp-input"
+                                value={bot.stake}
+                                onChange={(e) => {
+                                  const val = e.target.value;
+                                  setBots((prev) => prev.map((b) => (b.id === bot.id ? { ...b, stake: val } : b)));
+                                }}
+                                inputMode="decimal"
+                              />
+                            </label>
+                            <label>
+                              Martingale Factor
+                              <input
+                                type="text"
+                                className="mmp-input"
+                                value={bot.martingale}
+                                onChange={(e) => {
+                                  const val = e.target.value;
+                                  setBots((prev) => prev.map((b) => (b.id === bot.id ? { ...b, martingale: val } : b)));
+                                }}
+                                inputMode="decimal"
+                              />
+                            </label>
+                            <label>
+                              Market
                               <select
                                 className="mmp-select"
-                                value={bot.targetDigit ?? (isUnder ? 7 : 1)}
+                                value={bot.market}
                                 onChange={(e) => {
-                                  const dig = parseInt(e.target.value, 10);
-                                  setBots((prev) => prev.map((b) => (b.id === bot.id ? { ...b, targetDigit: dig } : b)));
+                                  const val = e.target.value;
+                                  setBots((prev) => prev.map((b) => (b.id === bot.id ? { ...b, market: val } : b)));
                                 }}
                               >
-                                {[0, 1, 2, 3, 4, 5, 6, 7, 8, 9].map((d) => (
-                                  <option key={d} value={d}>
-                                    Digit {d} {isOver ? `(Wins on ${d + 1}-9)` : `(Wins on 0-${d - 1})`}
-                                  </option>
+                                {MARKET_GROUPS.map((group) => (
+                                  <optgroup key={group.group} label={group.group}>
+                                    {group.items.map((item) => (
+                                      <option key={item.symbol} value={item.displayName}>
+                                        {item.displayName}
+                                      </option>
+                                    ))}
+                                  </optgroup>
                                 ))}
                               </select>
                             </label>
-                          )}
+                            <label>
+                              Contract Type
+                              <select
+                                className="mmp-select"
+                                value={bot.contractType}
+                                onChange={(e) => {
+                                  const val = e.target.value as ContractType;
+                                  setBots((prev) => prev.map((b) => (b.id === bot.id ? { ...b, contractType: val } : b)));
+                                }}
+                              >
+                                <option>Even</option>
+                                <option>Odd</option>
+                                <option>Rise</option>
+                                <option>Fall</option>
+                                <option>Over</option>
+                                <option>Under</option>
+                                <option>Accumulators</option>
+                              </select>
+                            </label>
 
-                          <label>
-                            Target Runs
-                            <input
-                              type="number"
-                              min="1"
-                              max="50"
-                              className="mmp-input"
-                              value={bot.targetRuns || 5}
-                              onChange={(e) => {
-                                const val = Math.max(1, parseInt(e.target.value, 10) || 1);
-                                setBots((prev) => prev.map((b) => (b.id === bot.id ? { ...b, targetRuns: val } : b)));
-                              }}
-                            />
-                          </label>
+                            {(isOver || isUnder) && (
+                              <label>
+                                Target Barrier Digit
+                                <select
+                                  className="mmp-select"
+                                  value={bot.targetDigit ?? (isUnder ? 7 : 1)}
+                                  onChange={(e) => {
+                                    const dig = parseInt(e.target.value, 10);
+                                    setBots((prev) => prev.map((b) => (b.id === bot.id ? { ...b, targetDigit: dig } : b)));
+                                  }}
+                                >
+                                  {[0, 1, 2, 3, 4, 5, 6, 7, 8, 9].map((d) => (
+                                    <option key={d} value={d}>
+                                      Digit {d} {isOver ? `(Wins on ${d + 1}-9)` : `(Wins on 0-${d - 1})`}
+                                    </option>
+                                  ))}
+                                </select>
+                              </label>
+                            )}
 
-                          <label>
-                            Take Profit ($)
-                            <input
-                              type="text"
-                              className="mmp-input"
-                              value={bot.takeProfit}
-                              onChange={(e) => {
-                                const val = e.target.value;
-                                setBots((prev) => prev.map((b) => (b.id === bot.id ? { ...b, takeProfit: val } : b)));
-                              }}
-                              inputMode="decimal"
-                            />
-                          </label>
-                          <label>
-                            Stop Loss ($)
-                            <input
-                              type="text"
-                              className="mmp-input"
-                              value={bot.stopLoss}
-                              onChange={(e) => {
-                                const val = e.target.value;
-                                setBots((prev) => prev.map((b) => (b.id === bot.id ? { ...b, stopLoss: val } : b)));
-                              }}
-                              inputMode="decimal"
-                            />
-                          </label>
-                        </div>
+                            <label>
+                              Target Runs
+                              <input
+                                type="number"
+                                min="1"
+                                max="50"
+                                className="mmp-input"
+                                value={bot.targetRuns || 5}
+                                onChange={(e) => {
+                                  const val = Math.max(1, parseInt(e.target.value, 10) || 1);
+                                  setBots((prev) => prev.map((b) => (b.id === bot.id ? { ...b, targetRuns: val } : b)));
+                                }}
+                              />
+                            </label>
 
-                        {/* Bot Action Buttons */}
-                        <div className="bot-actions-row">
-                          <button
-                            className="btn btn-run"
-                            type="button"
-                            onClick={() => toggleBot(bot.id)}
-                          >
-                            {bot.running ? <Square size={14} /> : <Play size={14} />}
-                            {bot.running ? 'Stop Bot' : 'Run Bot'}
-                          </button>
-                          <button
-                            className="btn-bot-sub"
-                            type="button"
-                            onClick={() => handleOpenEditBot(bot)}
-                            title="Configure bot rules and settings"
-                          >
-                            <Settings size={14} />
-                          </button>
-                          {bot.strategyId && (
+                            <label>
+                              Take Profit ($)
+                              <input
+                                type="text"
+                                className="mmp-input"
+                                value={bot.takeProfit}
+                                onChange={(e) => {
+                                  const val = e.target.value;
+                                  setBots((prev) => prev.map((b) => (b.id === bot.id ? { ...b, takeProfit: val } : b)));
+                                }}
+                                inputMode="decimal"
+                              />
+                            </label>
+                            <label>
+                              Stop Loss ($)
+                              <input
+                                type="text"
+                                className="mmp-input"
+                                value={bot.stopLoss}
+                                onChange={(e) => {
+                                  const val = e.target.value;
+                                  setBots((prev) => prev.map((b) => (b.id === bot.id ? { ...b, stopLoss: val } : b)));
+                                }}
+                                inputMode="decimal"
+                              />
+                            </label>
+                          </div>
+
+                          {/* Bot Action Buttons */}
+                          <div className="bot-actions-row">
+                            <button
+                              className="btn btn-run"
+                              type="button"
+                              onClick={() => toggleBot(bot.id)}
+                            >
+                              {bot.running ? <Square size={14} /> : <Play size={14} />}
+                              {bot.running ? 'Stop Bot' : 'Run Bot'}
+                            </button>
                             <button
                               className="btn-bot-sub"
                               type="button"
-                              onClick={() => {
-                                setSelectedStrategyId(bot.strategyId as any);
-                                setSignalMode('strategies');
-                                setActiveTab('dashboard');
-                                setBotRunToast(`Switched signal engine to ${bot.name} strategy!`);
-                                setTimeout(() => setBotRunToast(null), 3000);
-                              }}
-                              title="Load strategy into dashboard live signal engine"
+                              onClick={() => handleOpenEditBot(bot)}
+                              title="Configure bot rules and settings"
                             >
-                              <Zap size={14} />
+                              <Settings size={14} />
                             </button>
-                          )}
-                          {bots.length > 1 && (
+                            {bot.strategyId && (
+                              <button
+                                className="btn-bot-sub"
+                                type="button"
+                                onClick={() => {
+                                  setSelectedStrategyId(bot.strategyId as any);
+                                  setSignalMode('strategies');
+                                  setActiveTab('dashboard');
+                                  setBotRunToast(`Switched signal engine to ${bot.name} strategy!`);
+                                  setTimeout(() => setBotRunToast(null), 3000);
+                                }}
+                                title="Load strategy into dashboard live signal engine"
+                              >
+                                <Zap size={14} />
+                              </button>
+                            )}
                             <button
                               className="btn-bot-sub text-fall hover:text-fall"
                               type="button"
@@ -3981,12 +3833,12 @@ export function MarketMindApp() {
                             >
                               <Trash2 size={14} />
                             </button>
-                          )}
-                        </div>
-                      </article>
-                    );
-                  })}
-              </div>
+                          </div>
+                        </article>
+                      );
+                    })}
+                </div>
+              )}
             </div>
           </section>
         )}
