@@ -502,16 +502,11 @@ export function MarketMindApp() {
   const [bots, setBots] = useState<BotConfig[]>(INITIAL_BOTS);
 
   // Trades & Stats state
-  const [trades, setTrades] = useState<ActiveTrade[]>([
-    { id: '1', type: 'Even', symbol: 'Volatility 100 Index', symbolShort: 'V100', stake: 0.35, status: 'open', profit: 0.33, time: '12:04:18' },
-    { id: '2', type: 'Even', symbol: 'Volatility 100 Index', symbolShort: 'V100', stake: 0.35, status: 'open', profit: 0.33, time: '12:04:22' },
-    { id: '3', type: 'Odd', symbol: 'Volatility 75 Index', symbolShort: 'V75', stake: 0.50, status: 'open', profit: 0.48, time: '12:04:25' },
-    { id: '4', type: 'Rise', symbol: 'Volatility 50 Index', symbolShort: 'V50', stake: 1.00, status: 'open', profit: 0.95, time: '12:04:27' },
-  ]);
-  const [todayWins, setTodayWins] = useState<number>(11);
-  const [todayLosses, setTodayLosses] = useState<number>(5);
-  const [todayProfit, setTodayProfit] = useState<number>(24.80);
-  const [runsDone, setRunsDone] = useState<number>(3);
+  const [trades, setTrades] = useState<ActiveTrade[]>([]);
+  const [todayWins, setTodayWins] = useState<number>(0);
+  const [todayLosses, setTodayLosses] = useState<number>(0);
+  const [todayProfit, setTodayProfit] = useState<number>(0);
+  const [runsDone, setRunsDone] = useState<number>(0);
 
   // Risk Management state
   const [amountToRisk, setAmountToRisk] = useState<string>('200.00');
@@ -1388,16 +1383,16 @@ export function MarketMindApp() {
   const handleOpenNewBotModal = () => {
     setEditingBot({
       id: undefined,
-      name: 'over 1 with over 3 recovery',
+      name: `Active Bot (${activeMarket.displayName})`,
       market: activeMarket.displayName,
       contractType: 'Over',
       targetDigit: 1,
       strategyId: 'over-1',
       strategyName: 'Over Digit 1 Strategy',
       category: 'Deriv Strategies 2',
-      entryRule: 'Digits 0 & 1 < 10% (one red arc), 3+ digits (2-9) >= 11%, last 20 win rate >= 90%',
-      exitRule: 'Stop when hot digits disperse or target runs completed',
-      recoveryRule: 'Over 3 Recovery: trade Over 3 with 2.0x Martingale upon loss',
+      entryRule: 'Entry when signal setup conditions are met on live ticks',
+      exitRule: 'Stop when target runs completed or take-profit reached',
+      recoveryRule: 'Martingale recovery 2.0x upon loss',
       stake: '0.35',
       martingale: '2.0',
       targetRuns: 5,
@@ -2787,19 +2782,25 @@ export function MarketMindApp() {
             <div className="stats">
               <article className="stat">
                 <h2>Trades being taken</h2>
-                <p className="stat-value">{trades.filter((t) => t.status === 'open').length || 4}</p>
+                <p className="stat-value">{trades.filter((t) => t.status === 'open').length}</p>
                 <ul className="ticker">
-                  {trades.slice(0, 4).map((tr) => (
-                    <li key={tr.id}>
-                      <span className={`tag ${tr.type === 'Odd' || tr.type === 'Fall' ? 'dn' : 'up'}`}>
-                        {tr.type}
-                      </span>{' '}
-                      {tr.symbolShort} · {tr.stake.toFixed(2)}{' '}
-                      <em className={tr.type === 'Odd' || tr.type === 'Fall' ? 'dn' : 'up'}>
-                        {tr.status}
-                      </em>
+                  {trades.length > 0 ? (
+                    trades.slice(0, 4).map((tr) => (
+                      <li key={tr.id}>
+                        <span className={`tag ${tr.type === 'Odd' || tr.type === 'Fall' ? 'dn' : 'up'}`}>
+                          {tr.type}
+                        </span>{' '}
+                        {tr.symbolShort} · {tr.stake.toFixed(2)}{' '}
+                        <em className={tr.type === 'Odd' || tr.type === 'Fall' ? 'dn' : 'up'}>
+                          {tr.status}
+                        </em>
+                      </li>
+                    ))
+                  ) : (
+                    <li className="text-[11px] text-text-3 py-1">
+                      No open trades. Launch an active bot to start taking trades.
                     </li>
-                  ))}
+                  )}
                 </ul>
               </article>
 
@@ -3554,38 +3555,7 @@ export function MarketMindApp() {
                       onClick={handleOpenNewBotModal}
                     >
                       <Plus size={15} />
-                      Create New Strategy Bot
-                    </button>
-                    <button
-                      type="button"
-                      className="btn btn-outline"
-                      onClick={() => {
-                        const newBot: BotConfig = {
-                          id: `bot-${Date.now()}`,
-                          name: 'Over 1 with Over 3 Recovery',
-                          market: activeMarket.displayName,
-                          contractType: 'Over',
-                          targetDigit: 1,
-                          strategyId: 'over-1',
-                          strategyName: 'Over Digit 1 Strategy',
-                          category: 'Deriv Strategies 2',
-                          entryRule: 'Digits 0 & 1 < 10% (one red arc), 3+ digits (2-9) >= 11%, last 20 win rate >= 90%',
-                          exitRule: 'Stop if 2 consecutive digits <= 1 appear or profit target reached',
-                          recoveryRule: 'Over 3 Recovery: trade Over 3 with 2.0x Martingale upon loss',
-                          targetRuns: 5,
-                          stake: '0.35',
-                          martingale: '2.0',
-                          takeProfit: '25.00',
-                          stopLoss: '10.00',
-                          running: false,
-                        };
-                        setBots([newBot]);
-                        setBotRunToast('Added Over 1 Active Strategy Bot!');
-                        setTimeout(() => setBotRunToast(null), 3000);
-                      }}
-                    >
-                      <Zap size={14} className="text-accent" />
-                      Quick Add Over 1 Bot
+                      Add Active Strategy Bot
                     </button>
                   </div>
                 </div>
