@@ -76,7 +76,12 @@ import { DERIV_AUTO_BOT_PYTHON_SCRIPT } from './lib/derivAutoBotScript';
 import {
   decideAutoBotTrade,
   computeMartingaleStake,
+  runLength,
 } from './lib/derivAutoBotLogic';
+import {
+  derivTradingEngine,
+  TradeResult,
+} from './lib/derivTrading';
 
 const queryClient = new QueryClient();
 
@@ -168,6 +173,28 @@ export const MARKET_GROUPS: { group: string; items: MarketItem[] }[] = [
 
 const ALL_MARKETS = MARKET_GROUPS.flatMap((g) => g.items);
 
+export function getMarketSymbol(marketNameOrSymbol: string): string {
+  if (!marketNameOrSymbol) return 'R_100';
+  const found = ALL_MARKETS.find(
+    (m) =>
+      m.displayName.toLowerCase() === marketNameOrSymbol.toLowerCase() ||
+      m.symbol.toLowerCase() === marketNameOrSymbol.toLowerCase()
+  );
+  return found ? found.symbol : marketNameOrSymbol;
+}
+
+export function getMarketShort(symbol: string): string {
+  if (!symbol) return 'V100';
+  if (symbol.includes('100')) return 'V100';
+  if (symbol.includes('75')) return 'V75';
+  if (symbol.includes('50')) return 'V50';
+  if (symbol.includes('25')) return 'V25';
+  if (symbol.includes('10')) return 'V10';
+  if (symbol.includes('CRASH')) return 'CRASH';
+  if (symbol.includes('BOOM')) return 'BOOM';
+  return symbol;
+}
+
 export interface Tick {
   quote: number;
   epoch: number;
@@ -178,6 +205,7 @@ export interface Tick {
 
 export interface ActiveTrade {
   id: string;
+  contractId?: number | string;
   type: string;
   symbol: string;
   symbolShort: string;
@@ -185,6 +213,9 @@ export interface ActiveTrade {
   status: 'open' | 'won' | 'lost';
   profit: number;
   time: string;
+  isReal?: boolean;
+  longcode?: string;
+  exitSpot?: number | string;
 }
 
 export interface BotConfig {
@@ -219,6 +250,9 @@ export interface BotConfig {
   botTrades?: number;
   lastDecision?: string;
   isAutoBot?: boolean;
+  isBusy?: boolean;
+  activeContractId?: number | string;
+  lastTickEpoch?: number;
 }
 
 const INITIAL_BOTS: BotConfig[] = [
@@ -251,6 +285,7 @@ const INITIAL_BOTS: BotConfig[] = [
     botLosses: 0,
     botTrades: 0,
     isAutoBot: true,
+    isBusy: false,
   },
 ];
 
@@ -464,8 +499,10 @@ export function MarketMindApp() {
   const [showAppIdSettings, setShowAppIdSettings] = useState<boolean>(false);
   const [copiedCallback, setCopiedCallback] = useState<boolean>(false);
   const [manualTokenTab, setManualTokenTab] = useState<boolean>(false);
+  const [tradingMode, setTradingMode] = useState<'real' | 'simulation'>('real');
 
   const effectiveAppId = (customAppId || config?.publicAppId || DEFAULT_DERIV_APP_ID).trim();
+  const isTradingReady = Boolean(token.trim() && (accountProfile || realAccount || virtualAccount) && derivTradingEngine.isReady());
 
   // Deriv Live WebSocket & Ticks
   const [ticks, setTicks] = useState<Tick[]>(() => generateSeedTicks(ALL_MARKETS[4], 120));
@@ -561,6 +598,10 @@ export function MarketMindApp() {
 
   // Bots state
   const [bots, setBots] = useState<BotConfig[]>(INITIAL_BOTS);
+  const botsRef = useRef<BotConfig[]>(INITIAL_BOTS);
+  useEffect(() => {
+    botsRef.current = bots;
+  }, [bots]);
 
   // Trades & Stats state
   const [trades, setTrades] = useState<ActiveTrade[]>([]);
@@ -786,11 +827,12 @@ export function MarketMindApp() {
     try {
       ws = new WebSocket(wsUrl);
       accountSocketRef.current = ws;
+      derivTradingEngine.setSocket(ws, false, 'USD');
 
       ws.onopen = () => {
         if (isCancelled) return;
         // Authorize with token
-        ws?.send(JSON.stringify({ authorize: token.trim() }));
+        ws?.send(JSON.stringify({ authorize: token.trim(), req_id: 1 }));
 
         // Deriv closes idle connections after ~2 minutes; keep-alive every 25s
         pingInterval = window.setInterval(() => {
@@ -805,7 +847,10 @@ export function MarketMindApp() {
         try {
           const data = JSON.parse(event.data);
 
-          if (data.error) {
+          // Route to derivTradingEngine for request promises and contract updates
+          derivTradingEngine.handleMessage(data);
+
+          if (data.error && !data.req_id) {
             console.error(`Deriv Account Error [${data.error.code}]: ${data.error.message}`);
             setAuthError(`[${data.error.code}]: ${data.error.message}`);
             setIsAuthorizing(false);
@@ -817,6 +862,8 @@ export function MarketMindApp() {
             const isVirtual = Boolean(auth.is_virtual);
             const bal = Number(auth.balance ?? 0);
             const cur = auth.currency || 'USD';
+
+            derivTradingEngine.setAuthorized(true, cur);
 
             const profile: DerivAccountProfile = {
               loginid: auth.loginid,
@@ -864,22 +911,26 @@ export function MarketMindApp() {
         if (!isCancelled) {
           console.error('Deriv account socket error:', err);
           setIsAuthorizing(false);
+          derivTradingEngine.setSocket(null, false);
         }
       };
 
       ws.onclose = () => {
         if (!isCancelled) {
           setIsAuthorizing(false);
+          derivTradingEngine.setSocket(null, false);
         }
       };
     } catch (err: any) {
       setAuthError(err?.message || 'Failed to connect to Deriv');
       setIsAuthorizing(false);
+      derivTradingEngine.setSocket(null, false);
     }
 
     return () => {
       isCancelled = true;
       if (pingInterval) clearInterval(pingInterval);
+      derivTradingEngine.setSocket(null, false);
       if (ws) {
         ws.close();
       }
@@ -1914,18 +1965,261 @@ export function MarketMindApp() {
     }
   }, [derivCandles, derivCandleMarket.pipSize]);
 
-  // Bot execution loop: when bots are running, trigger trades dynamically with strategy rules
+  // Real Deriv Bot Trade Executor
+  const executeBotTrade = async (
+    targetBot: BotConfig,
+    decision: { contractType: string; barrier?: number | string; reason: string }
+  ) => {
+    const baseStake = parseFloat(targetBot.stake) || 1.0;
+    const martingale = parseFloat(targetBot.martingale) || 1.0;
+    const lossRun = targetBot.lossRun || 0;
+    const maxStake = parseFloat(targetBot.maxStake || '100.0') || 100.0;
+    const tradeStake = computeMartingaleStake(baseStake, martingale, lossRun, maxStake);
+    const botMarketSymbol = getMarketSymbol(targetBot.market);
+    const activeCurrency =
+      accountProfile?.currency ||
+      (isRealAccount ? realAccount?.currency : virtualAccount?.currency) ||
+      'USD';
+
+    const isLiveDerivTrade = tradingMode === 'real' && derivTradingEngine.isReady();
+
+    // Mark bot as busy so no duplicate trades fire
+    setBots((prev) =>
+      prev.map((b) =>
+        b.id === targetBot.id
+          ? {
+              ...b,
+              isBusy: true,
+              currentStake: tradeStake,
+              lastDecision: `${isLiveDerivTrade ? '⚡ [REAL DERIV]' : '🧪 [SIM]'} Executing BUY ${decision.contractType} ${decision.barrier ?? ''} ($${tradeStake.toFixed(2)})...`,
+            }
+          : b
+      )
+    );
+
+    const tempTradeId = String(Date.now());
+    const initialTrade: ActiveTrade = {
+      id: tempTradeId,
+      type: decision.barrier !== undefined ? `${decision.contractType} ${decision.barrier}` : decision.contractType,
+      symbol: targetBot.market,
+      symbolShort: getMarketShort(botMarketSymbol),
+      stake: tradeStake,
+      status: 'open',
+      profit: 0,
+      time: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' }),
+      isReal: isLiveDerivTrade,
+    };
+    setTrades((prev) => [initialTrade, ...prev.slice(0, 15)]);
+
+    try {
+      let result: TradeResult;
+
+      if (isLiveDerivTrade) {
+        // Place real trade on Deriv API!
+        result = await derivTradingEngine.executeTrade({
+          contractType: decision.contractType,
+          barrier: decision.barrier,
+          symbol: botMarketSymbol,
+          stake: tradeStake,
+          currency: activeCurrency,
+          duration: 1,
+          durationUnit: 't',
+          onPurchased: (info) => {
+            setTrades((prev) =>
+              prev.map((t) =>
+                t.id === tempTradeId
+                  ? {
+                      ...t,
+                      contractId: info.contractId,
+                      longcode: info.longcode,
+                    }
+                  : t
+              )
+            );
+            setBots((prev) =>
+              prev.map((b) =>
+                b.id === targetBot.id
+                  ? {
+                      ...b,
+                      activeContractId: info.contractId,
+                      lastDecision: `⚡ Contract #${info.contractId} open on Deriv. Settling 1-tick...`,
+                    }
+                  : b
+              )
+            );
+          },
+        });
+      } else {
+        // Simulation mode
+        await new Promise((r) => setTimeout(r, 1200));
+        const lastDigit = ticks[0]?.lastDigit ?? Math.floor(Math.random() * 10);
+        result = derivTradingEngine.simulateTrade(
+          {
+            contractType: decision.contractType,
+            barrier: decision.barrier,
+            symbol: botMarketSymbol,
+            stake: tradeStake,
+          },
+          lastDigit,
+          priceDiff
+        );
+      }
+
+      const won = result.status === 'won';
+      const profitDelta = result.profit;
+
+      let nextMode = targetBot.mode || 'NORMAL';
+      let nextLossRun = targetBot.lossRun || 0;
+      let nextEntered = Boolean(targetBot.entered);
+
+      if (targetBot.isAutoBot || targetBot.strategyId === 'over-2-recovery') {
+        if (decision.contractType === 'Over') {
+          nextEntered = true;
+        }
+        if (won) {
+          nextLossRun = 0;
+          if (nextMode === 'RECOVERY') {
+            nextMode = 'NORMAL';
+            nextEntered = true;
+          }
+        } else {
+          nextLossRun = (targetBot.lossRun || 0) + 1;
+          if (nextMode === 'NORMAL') {
+            nextMode = 'RECOVERY';
+          }
+        }
+      } else {
+        if (won) nextLossRun = 0;
+        else nextLossRun = (targetBot.lossRun || 0) + 1;
+      }
+
+      const newBotPnl = Number(((targetBot.botPnl || 0) + profitDelta).toFixed(2));
+      const tpVal = parseFloat(targetBot.takeProfit || '5.0') || 5.0;
+      const slVal = parseFloat(targetBot.stopLoss || '10.0') || 10.0;
+
+      let shouldStop = false;
+      let stopReason = '';
+      if (newBotPnl >= tpVal) {
+        shouldStop = true;
+        stopReason = `Take profit target reached (+${newBotPnl.toFixed(2)})`;
+      } else if (newBotPnl <= -slVal) {
+        shouldStop = true;
+        stopReason = `Stop loss limit reached (${newBotPnl.toFixed(2)})`;
+      }
+
+      const nextStake = computeMartingaleStake(baseStake, martingale, nextLossRun, maxStake);
+
+      setBots((prev) =>
+        prev.map((b) =>
+          b.id === targetBot.id
+            ? {
+                ...b,
+                isBusy: false,
+                activeContractId: undefined,
+                mode: nextMode,
+                lossRun: nextLossRun,
+                entered: nextEntered,
+                botPnl: newBotPnl,
+                botWins: (b.botWins || 0) + (won ? 1 : 0),
+                botLosses: (b.botLosses || 0) + (won ? 0 : 1),
+                botTrades: (b.botTrades || 0) + 1,
+                currentStake: nextStake,
+                running: shouldStop ? false : b.running,
+                lastDecision: `${won ? '✅ WON' : '❌ LOST'} ${profitDelta > 0 ? '+' : ''}$${profitDelta.toFixed(2)} (Contract #${result.contractId || ''})${result.exitTick !== undefined ? ` [Exit: ${result.exitTick}]` : ''}`,
+              }
+            : b
+        )
+      );
+
+      if (shouldStop) {
+        setBotRunToast(`${targetBot.name}: ${stopReason}!`);
+      }
+
+      setTodayProfit((prev) => Number((prev + profitDelta).toFixed(2)));
+      if (won) setTodayWins((w) => w + 1);
+      else setTodayLosses((l) => l + 1);
+
+      if (result.balanceAfter !== undefined) {
+        setAccountProfile((prev) => (prev ? { ...prev, balance: result.balanceAfter! } : null));
+      } else if (!isRealAccount && !isLiveDerivTrade) {
+        setDemoBalance((prev) => Number((prev + profitDelta).toFixed(2)));
+      }
+
+      setTrades((prev) =>
+        prev.map((t) =>
+          t.id === tempTradeId
+            ? {
+                ...t,
+                contractId: result.contractId,
+                status: won ? 'won' : 'lost',
+                profit: profitDelta,
+                exitSpot: result.exitTick,
+                longcode: result.longcode || t.longcode,
+              }
+            : t
+        )
+      );
+    } catch (error: any) {
+      console.error(`Bot trade error [${targetBot.name}]:`, error);
+      const errMsg = error?.message || 'Trade execution failed';
+
+      setBots((prev) =>
+        prev.map((b) =>
+          b.id === targetBot.id
+            ? {
+                ...b,
+                isBusy: false,
+                activeContractId: undefined,
+                lastDecision: `⚠️ Trade Error: ${errMsg}`,
+              }
+            : b
+        )
+      );
+
+      setBotRunToast(`Trade Error [${targetBot.name}]: ${errMsg}`);
+
+      setTrades((prev) =>
+        prev.map((t) =>
+          t.id === tempTradeId
+            ? {
+                ...t,
+                status: 'lost',
+                profit: 0,
+                longcode: `Error: ${errMsg}`,
+              }
+            : t
+        )
+      );
+    }
+  };
+
+  // Bot execution loop: runs automatically whenever live ticks arrive
   useEffect(() => {
     const runningBots = bots.filter((b) => b.running);
     if (runningBots.length === 0 || ticks.length === 0) return;
 
-    const interval = setInterval(() => {
-      const activeBot = runningBots[Math.floor(Math.random() * runningBots.length)];
-      const lastDigit = ticks[0]?.lastDigit ?? Math.floor(Math.random() * 10);
+    const latestTick = ticks[0];
+    if (!latestTick) return;
+
+    runningBots.forEach((activeBot) => {
+      if (activeBot.isBusy) return;
+
+      const botMarketSymbol = getMarketSymbol(activeBot.market);
+      // Process if tick is for bot's market, or if active market matches
+      if (latestTick.symbol !== botMarketSymbol && activeMarket.symbol !== botMarketSymbol) {
+        return;
+      }
+
+      // Avoid executing multiple times on the exact same tick epoch
+      if (activeBot.lastTickEpoch === latestTick.epoch) {
+        return;
+      }
+      activeBot.lastTickEpoch = latestTick.epoch;
+
+      const recentDigits = ticks.slice(0, 35).map((t) => t.lastDigit).reverse();
 
       // Special execution path for Deriv Auto Bot (Over 2 + Even/Odd Recovery)
       if (activeBot.isAutoBot || activeBot.strategyId === 'over-2-recovery') {
-        const recentDigits = ticks.slice(0, 35).map((t) => t.lastDigit).reverse();
         const mode = activeBot.mode || 'NORMAL';
         const entered = Boolean(activeBot.entered);
         const barrier = activeBot.targetDigit ?? 2;
@@ -1934,16 +2228,16 @@ export function MarketMindApp() {
         const decision = decideAutoBotTrade(recentDigits, mode, entered, barrier, streak);
 
         if (!decision) {
-          // Waiting for setup condition
           setBots((prev) =>
             prev.map((b) =>
               b.id === activeBot.id
                 ? {
                     ...b,
+                    lastTickEpoch: latestTick.epoch,
                     lastDecision:
                       mode === 'NORMAL'
-                        ? `[NORMAL] Waiting for >= ${streak} digits <= ${barrier} then digit > ${barrier}...`
-                        : `[RECOVERY] Waiting for >= ${streak} alternating parity pattern...`,
+                        ? `[NORMAL] Digit ${latestTick.lastDigit} | Waiting for >= ${streak} digits <= ${barrier} then digit > ${barrier}...`
+                        : `[RECOVERY] Digit ${latestTick.lastDigit} | Waiting for >= ${streak} alternating parity pattern...`,
                   }
                 : b
             )
@@ -1951,179 +2245,99 @@ export function MarketMindApp() {
           return;
         }
 
-        // Setup condition satisfied or continuous cycle active!
-        const baseStake = parseFloat(activeBot.stake) || 1.0;
-        const martingale = parseFloat(activeBot.martingale) || 1.0;
-        const lossRun = activeBot.lossRun || 0;
-        const maxStake = parseFloat(activeBot.maxStake || '100.0') || 100.0;
-        const tradeStake = computeMartingaleStake(baseStake, martingale, lossRun, maxStake);
+        executeBotTrade(activeBot, {
+          contractType: decision.contractType,
+          barrier: decision.barrier ?? barrier,
+          reason: decision.reason,
+        });
+        return;
+      }
 
-        let won = false;
-        let payoutRate = 0.95;
+      // Standard / other strategy bots
+      const targetDig = activeBot.targetDigit ?? (activeBot.contractType === 'Under' ? 7 : 2);
+      const isOver = activeBot.contractType === 'Over';
+      const isUnder = activeBot.contractType === 'Under';
+      const isEven = activeBot.contractType === 'Even';
+      const isOdd = activeBot.contractType === 'Odd';
+      const isRise = activeBot.contractType === 'Rise' || activeBot.contractType === 'Higher';
+      const isFall = activeBot.contractType === 'Fall' || activeBot.contractType === 'Lower';
 
-        if (decision.contractType === 'Over') {
-          won = lastDigit > (decision.barrier ?? barrier);
-          payoutRate = (decision.barrier ?? barrier) === 1 ? 0.22 : (decision.barrier ?? barrier) === 2 ? 0.38 : 0.58;
-        } else if (decision.contractType === 'Under') {
-          won = lastDigit < (decision.barrier ?? barrier);
-          payoutRate = 0.38;
-        } else if (decision.contractType === 'Even') {
-          won = lastDigit % 2 === 0;
-          payoutRate = 0.95;
-        } else if (decision.contractType === 'Odd') {
-          won = lastDigit % 2 !== 0;
-          payoutRate = 0.95;
+      let shouldTrade = false;
+      let reason = '';
+
+      if (isOver) {
+        const streakReq = activeBot.streak ?? 2;
+        const prev = recentDigits.slice(0, -1);
+        const underRun = runLength(prev, (x) => x <= targetDig);
+        if (latestTick.lastDigit > targetDig && underRun >= streakReq) {
+          shouldTrade = true;
+          reason = `Over Setup: ${underRun} digits <= ${targetDig} followed by ${latestTick.lastDigit} > ${targetDig}`;
+        } else if (activeBot.entered) {
+          shouldTrade = true;
+          reason = `Continuous Over ${targetDig} cycle`;
         }
-
-        const profitDelta = won ? Number((tradeStake * payoutRate).toFixed(2)) : -tradeStake;
-
-        // Transition modes per Python strategy:
-        // NORMAL -> on loss -> RECOVERY
-        // RECOVERY -> on win -> NORMAL
-        let nextMode = mode;
-        let nextLossRun = lossRun;
-        let nextEntered = entered;
-
-        if (decision.contractType === 'Over') {
-          nextEntered = true;
+      } else if (isUnder) {
+        const streakReq = activeBot.streak ?? 2;
+        const prev = recentDigits.slice(0, -1);
+        const overRun = runLength(prev, (x) => x >= targetDig);
+        if (latestTick.lastDigit < targetDig && overRun >= streakReq) {
+          shouldTrade = true;
+          reason = `Under Setup: ${overRun} digits >= ${targetDig} followed by ${latestTick.lastDigit} < ${targetDig}`;
+        } else if (activeBot.entered) {
+          shouldTrade = true;
+          reason = `Continuous Under ${targetDig} cycle`;
         }
-
-        if (won) {
-          nextLossRun = 0;
-          if (mode === 'RECOVERY') {
-            nextMode = 'NORMAL';
-            nextEntered = true;
-          }
-        } else {
-          nextLossRun = lossRun + 1;
-          if (mode === 'NORMAL') {
-            nextMode = 'RECOVERY';
-          }
+      } else if (isEven) {
+        const streakReq = activeBot.streak ?? 2;
+        const prev = recentDigits.slice(0, -1);
+        const oddRun = runLength(prev, (x) => x % 2 !== 0);
+        if (latestTick.lastDigit % 2 === 0 && oddRun >= streakReq) {
+          shouldTrade = true;
+          reason = `Even Setup: ${oddRun} odd digits in a row followed by even digit ${latestTick.lastDigit}`;
         }
-
-        const newBotPnl = Number(((activeBot.botPnl || 0) + profitDelta).toFixed(2));
-        const tpVal = parseFloat(activeBot.takeProfit) || 5.0;
-        const slVal = parseFloat(activeBot.stopLoss) || 10.0;
-
-        let shouldStop = false;
-        let stopReason = '';
-        if (newBotPnl >= tpVal) {
-          shouldStop = true;
-          stopReason = `Take profit reached (+${newBotPnl.toFixed(2)})`;
-        } else if (newBotPnl <= -slVal) {
-          shouldStop = true;
-          stopReason = `Stop loss reached (${newBotPnl.toFixed(2)})`;
+      } else if (isOdd) {
+        const streakReq = activeBot.streak ?? 2;
+        const prev = recentDigits.slice(0, -1);
+        const evenRun = runLength(prev, (x) => x % 2 === 0);
+        if (latestTick.lastDigit % 2 !== 0 && evenRun >= streakReq) {
+          shouldTrade = true;
+          reason = `Odd Setup: ${evenRun} even digits in a row followed by odd digit ${latestTick.lastDigit}`;
         }
+      } else if (isRise || isFall) {
+        const quoteDelta = (ticks[0]?.quote ?? 0) - (ticks[1]?.quote ?? 0);
+        if (isRise && quoteDelta > 0) {
+          shouldTrade = true;
+          reason = `Price rising (Delta: +${quoteDelta.toFixed(4)})`;
+        } else if (isFall && quoteDelta < 0) {
+          shouldTrade = true;
+          reason = `Price falling (Delta: ${quoteDelta.toFixed(4)})`;
+        }
+      } else {
+        shouldTrade = true;
+        reason = `Tick trigger on ${activeBot.market}`;
+      }
 
+      if (shouldTrade) {
+        executeBotTrade(activeBot, {
+          contractType: activeBot.contractType,
+          barrier: targetDig,
+          reason,
+        });
+      } else {
         setBots((prev) =>
           prev.map((b) =>
             b.id === activeBot.id
               ? {
                   ...b,
-                  mode: nextMode,
-                  lossRun: nextLossRun,
-                  entered: nextEntered,
-                  botPnl: newBotPnl,
-                  botWins: (b.botWins || 0) + (won ? 1 : 0),
-                  botLosses: (b.botLosses || 0) + (won ? 0 : 1),
-                  botTrades: (b.botTrades || 0) + 1,
-                  currentStake: tradeStake,
-                  running: shouldStop ? false : b.running,
-                  lastDecision: `${decision.reason} -> ${won ? 'WIN' : 'LOSS'} (${profitDelta > 0 ? '+' : ''}${profitDelta.toFixed(2)})`,
+                  lastTickEpoch: latestTick.epoch,
+                  lastDecision: `Watching ticks on ${activeBot.market}... Last digit: ${latestTick.lastDigit}`,
                 }
               : b
           )
         );
-
-        if (shouldStop) {
-          setBotRunToast(`${activeBot.name}: ${stopReason}!`);
-        }
-
-        // Update balances
-        if (!isRealAccount) {
-          setDemoBalance((prev) => Number((prev + profitDelta).toFixed(2)));
-        }
-        setTodayProfit((prev) => Number((prev + profitDelta).toFixed(2)));
-
-        if (won) setTodayWins((w) => w + 1);
-        else setTodayLosses((l) => l + 1);
-
-        const newTrade: ActiveTrade = {
-          id: String(Date.now()),
-          type: decision.barrier !== undefined ? `${decision.contractType} ${decision.barrier} [${mode}]` : `${decision.contractType} [${mode}]`,
-          symbol: activeBot.market,
-          symbolShort: activeBot.market.includes('100') ? 'V100' : activeBot.market.includes('75') ? 'V75' : activeBot.market.includes('50') ? 'V50' : 'V25',
-          stake: tradeStake,
-          status: won ? 'won' : 'lost',
-          profit: profitDelta,
-          time: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' }),
-        };
-
-        setTrades((prev) => [newTrade, ...prev.slice(0, 7)]);
-        return;
       }
-
-      // Standard / other bots execution
-      const stakeNum = parseFloat(activeBot.stake) || 0.35;
-      const targetDig = activeBot.targetDigit ?? (activeBot.contractType === 'Under' ? 7 : 2);
-
-      // Realistic outcome evaluation based on contract type & strategy rules
-      let won = false;
-      let payoutRate = 0.95;
-
-      if (activeBot.contractType === 'Over') {
-        won = lastDigit > targetDig;
-        payoutRate = targetDig === 1 ? 0.22 : targetDig === 2 ? 0.38 : targetDig === 3 ? 0.58 : targetDig === 4 ? 0.95 : 1.45;
-      } else if (activeBot.contractType === 'Under') {
-        won = lastDigit < targetDig;
-        payoutRate = targetDig === 8 ? 0.22 : targetDig === 7 ? 0.38 : targetDig === 6 ? 0.58 : targetDig === 5 ? 0.95 : 1.45;
-      } else if (activeBot.contractType === 'Even') {
-        won = lastDigit % 2 === 0;
-        payoutRate = 0.95;
-      } else if (activeBot.contractType === 'Odd') {
-        won = lastDigit % 2 !== 0;
-        payoutRate = 0.95;
-      } else if (activeBot.contractType === 'Rise') {
-        won = (ticks[0]?.quote ?? 0) >= (ticks[1]?.quote ?? 0);
-        payoutRate = 0.95;
-      } else if (activeBot.contractType === 'Fall') {
-        won = (ticks[0]?.quote ?? 0) <= (ticks[1]?.quote ?? 0);
-        payoutRate = 0.95;
-      } else {
-        won = Math.random() > 0.42;
-        payoutRate = 0.95;
-      }
-
-      const profitDelta = won ? Number((stakeNum * payoutRate).toFixed(2)) : -stakeNum;
-
-      // Update balances
-      if (!isRealAccount) {
-        setDemoBalance((prev) => Number((prev + profitDelta).toFixed(2)));
-      }
-      setTodayProfit((prev) => Number((prev + profitDelta).toFixed(2)));
-
-      if (won) setTodayWins((w) => w + 1);
-      else setTodayLosses((l) => l + 1);
-
-      setRunsDone((r) => (r >= runsStepper ? 1 : r + 1));
-
-      // Append trade to ticker
-      const newTrade: ActiveTrade = {
-        id: String(Date.now()),
-        type: activeBot.targetDigit !== undefined ? `${activeBot.contractType} ${activeBot.targetDigit}` : activeBot.contractType,
-        symbol: activeBot.market,
-        symbolShort: activeBot.market.includes('100') ? 'V100' : activeBot.market.includes('75') ? 'V75' : activeBot.market.includes('50') ? 'V50' : 'V25',
-        stake: stakeNum,
-        status: won ? 'won' : 'lost',
-        profit: profitDelta,
-        time: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' }),
-      };
-
-      setTrades((prev) => [newTrade, ...prev.slice(0, 7)]);
-    }, 4500);
-
-    return () => clearInterval(interval);
-  }, [bots, ticks, isRealAccount, runsStepper]);
+    });
+  }, [ticks[0]?.epoch, ticks[0]?.quote, tradingMode]);
 
   // Deriv OAuth & Account Actions
   const handleOAuthLogin = async (openDirect = false) => {
@@ -2265,9 +2479,31 @@ export function MarketMindApp() {
 
   // Bot toggle runner
   const toggleBot = (id: string) => {
+    const target = bots.find((b) => b.id === id);
+    if (!target) return;
+
+    const willRun = !target.running;
+
+    if (willRun && tradingMode === 'real' && !derivTradingEngine.isReady()) {
+      if (!token.trim()) {
+        setTokenModalOpen(true);
+        setBotRunToast('Deriv API Token or OAuth required to place real trades. Please connect your account.');
+        return;
+      } else if (isAuthorizing) {
+        setBotRunToast('Authorizing with Deriv WebSocket server... Bot will start taking trades once connected.');
+      }
+    }
+
     setBots((prev) =>
-      prev.map((b) => (b.id === id ? { ...b, running: !b.running } : b))
+      prev.map((b) => (b.id === id ? { ...b, running: willRun, isBusy: false } : b))
     );
+
+    if (willRun) {
+      const isLive = tradingMode === 'real' && derivTradingEngine.isReady();
+      setBotRunToast(
+        `${target.name} started in ${isLive ? 'REAL DERIV API' : 'SIMULATION'} mode!`
+      );
+    }
   };
 
   const stopAllBots = () => {
@@ -3066,14 +3302,21 @@ export function MarketMindApp() {
                 <p className="stat-value">{trades.filter((t) => t.status === 'open').length}</p>
                 <ul className="ticker">
                   {trades.length > 0 ? (
-                    trades.slice(0, 4).map((tr) => (
-                      <li key={tr.id}>
-                        <span className={`tag ${tr.type === 'Odd' || tr.type === 'Fall' ? 'dn' : 'up'}`}>
-                          {tr.type}
-                        </span>{' '}
-                        {tr.symbolShort} · {tr.stake.toFixed(2)}{' '}
-                        <em className={tr.type === 'Odd' || tr.type === 'Fall' ? 'dn' : 'up'}>
-                          {tr.status}
+                    trades.slice(0, 5).map((tr) => (
+                      <li key={tr.id} className="flex items-center justify-between gap-1">
+                        <div className="flex items-center gap-1.5 truncate">
+                          <span className={`tag ${tr.type.toLowerCase().includes('odd') || tr.type.toLowerCase().includes('fall') || tr.type.toLowerCase().includes('under') ? 'dn' : 'up'}`}>
+                            {tr.type}
+                          </span>{' '}
+                          <span className="font-mono">{tr.symbolShort}</span> · ${tr.stake.toFixed(2)}
+                          {tr.contractId && (
+                            <span className="text-[10px] font-mono px-1 py-0.2 rounded bg-black/40 text-accent font-semibold" title={`Deriv Contract ID: #${tr.contractId}`}>
+                              #{String(tr.contractId).slice(-6)}
+                            </span>
+                          )}
+                        </div>
+                        <em className={tr.status === 'won' ? 'up font-bold' : tr.status === 'lost' ? 'dn font-bold' : 'text-amber-400 font-bold animate-pulse'}>
+                          {tr.status === 'open' ? 'OPEN' : tr.status === 'won' ? `+${tr.profit.toFixed(2)}` : tr.profit.toFixed(2)}
                         </em>
                       </li>
                     ))
@@ -3793,6 +4036,93 @@ export function MarketMindApp() {
                 </div>
               </div>
 
+              {/* Deriv Real API Live Trading Control Banner */}
+              <div className="mb-4 rounded-xl border border-[var(--line)] bg-[var(--surface-2)] p-3.5 sm:p-4 flex flex-col sm:flex-row sm:items-center justify-between gap-3 shadow-sm">
+                <div className="flex items-center gap-3">
+                  <div
+                    className={`w-10 h-10 rounded-xl flex items-center justify-center font-bold text-lg shrink-0 ${
+                      isTradingReady
+                        ? 'bg-emerald-500/20 text-emerald-400 border border-emerald-500/40'
+                        : 'bg-amber-500/20 text-amber-400 border border-amber-500/40'
+                    }`}
+                  >
+                    {isTradingReady ? <Zap size={20} className="animate-pulse" /> : <AlertTriangle size={20} />}
+                  </div>
+                  <div>
+                    <div className="flex items-center gap-2 flex-wrap">
+                      <span className="font-bold text-sm text-text">
+                        {isTradingReady
+                          ? 'Deriv Real API Trading Active'
+                          : token.trim() && isAuthorizing
+                          ? 'Authorizing with Deriv...'
+                          : 'Deriv Account Disconnected'}
+                      </span>
+                      <span
+                        className={`text-[10px] font-mono px-2 py-0.5 rounded font-bold uppercase ${
+                          isTradingReady
+                            ? (isRealAccount || !accountProfile?.isVirtual)
+                              ? 'bg-rose-500/20 text-rose-300 border border-rose-500/40'
+                              : 'bg-emerald-500/20 text-emerald-300 border border-emerald-500/40'
+                            : 'bg-amber-500/20 text-amber-300 border border-amber-500/40'
+                        }`}
+                      >
+                        {isTradingReady
+                          ? (isRealAccount || !accountProfile?.isVirtual)
+                            ? 'REAL ACCOUNT'
+                            : 'DEMO ACCOUNT'
+                          : 'OFFLINE'}
+                      </span>
+                    </div>
+                    <p className="text-xs text-text-3 mt-0.5">
+                      {isTradingReady
+                        ? `Connected: ${accountProfile?.loginid || activeAccountLogin} · Balance: ${currentCurrency} ${currentBalance.toFixed(2)} · Automated 1-tick contracts placed directly on Deriv platform.`
+                        : 'Connect your Deriv API token (with "Trade" scope) or log in to take real trades on Deriv.'}
+                    </p>
+                  </div>
+                </div>
+
+                <div className="flex items-center gap-2 shrink-0 self-end sm:self-center">
+                  <div className="flex items-center rounded-lg bg-[var(--surface)] p-1 border border-[var(--line-soft)] text-xs">
+                    <button
+                      type="button"
+                      className={`px-2.5 py-1 rounded font-medium transition-all ${
+                        tradingMode === 'real'
+                          ? 'bg-live text-black font-bold shadow-sm'
+                          : 'text-text-3 hover:text-text'
+                      }`}
+                      onClick={() => {
+                        if (!isTradingReady && !token.trim()) {
+                          setTokenModalOpen(true);
+                        }
+                        setTradingMode('real');
+                      }}
+                    >
+                      Real Deriv API
+                    </button>
+                    <button
+                      type="button"
+                      className={`px-2.5 py-1 rounded font-medium transition-all ${
+                        tradingMode === 'simulation'
+                          ? 'bg-accent/20 text-accent font-bold border border-accent/40 shadow-sm'
+                          : 'text-text-3 hover:text-text'
+                      }`}
+                      onClick={() => setTradingMode('simulation')}
+                    >
+                      Simulation Mode
+                    </button>
+                  </div>
+
+                  <button
+                    type="button"
+                    className="btn btn-secondary text-xs flex items-center gap-1.5"
+                    onClick={() => setTokenModalOpen(true)}
+                  >
+                    <KeyRound size={13} className="text-live" />
+                    {isTradingReady ? 'Switch Account' : 'Connect Account'}
+                  </button>
+                </div>
+              </div>
+
               {/* Bot Category Filter Navigation */}
               <div className="bot-category-bar">
                 <button
@@ -3946,10 +4276,23 @@ export function MarketMindApp() {
                             </div>
                           )}
 
+                          {/* Active Contract Status */}
+                          {bot.isBusy && (
+                            <div className="mb-2 px-2.5 py-1.5 rounded-lg bg-emerald-500/15 border border-emerald-500/40 text-[11px] font-mono text-emerald-300 flex items-center justify-between animate-pulse">
+                              <div className="flex items-center gap-2 truncate">
+                                <span className="inline-block w-2 h-2 rounded-full bg-emerald-400 animate-ping shrink-0" />
+                                <span className="truncate font-semibold">
+                                  {bot.activeContractId ? `Contract #${bot.activeContractId} OPEN` : 'PLACING REAL TRADE...'}
+                                </span>
+                              </div>
+                              <span className="text-[10px] uppercase font-bold text-emerald-400 shrink-0 ml-1">1-Tick Settling</span>
+                            </div>
+                          )}
+
                           {/* Live Decision Tracker */}
-                          {bot.lastDecision && bot.running && (
+                          {bot.lastDecision && (
                             <div className="mb-2 px-2.5 py-1 rounded bg-black/40 border border-accent/20 text-[11px] font-mono text-accent flex items-center gap-1.5">
-                              <span className="inline-block w-1.5 h-1.5 rounded-full bg-accent animate-ping" />
+                              <span className="inline-block w-1.5 h-1.5 rounded-full bg-accent animate-ping shrink-0" />
                               <span className="truncate">{bot.lastDecision}</span>
                             </div>
                           )}
@@ -4193,6 +4536,84 @@ export function MarketMindApp() {
                         </article>
                       );
                     })}
+                </div>
+              )}
+
+              {/* Live Bot Execution History */}
+              {trades.length > 0 && (
+                <div className="mt-8 border-t border-[var(--line-soft)] pt-5">
+                  <div className="flex items-center justify-between mb-3 flex-wrap gap-2">
+                    <div className="flex items-center gap-2">
+                      <Zap size={15} className="text-accent" />
+                      <h3 className="text-xs font-bold text-text uppercase tracking-wider">
+                        Live Bot Execution History ({trades.length})
+                      </h3>
+                    </div>
+                    <span className="text-[11px] text-text-3 font-mono">
+                      {trades.filter((t) => t.isReal).length} Real Deriv Orders · {trades.filter((t) => !t.isReal).length} Simulated
+                    </span>
+                  </div>
+
+                  <div className="overflow-x-auto rounded-xl border border-[var(--line-soft)] bg-[var(--surface-2)]/40 shadow-sm">
+                    <table className="w-full text-left font-mono text-xs">
+                      <thead>
+                        <tr className="border-b border-[var(--line-soft)] text-[10px] text-text-3 uppercase bg-[var(--surface-2)]">
+                          <th className="p-2.5">Time</th>
+                          <th className="p-2.5">Market</th>
+                          <th className="p-2.5">Contract</th>
+                          <th className="p-2.5">Deriv Contract ID</th>
+                          <th className="p-2.5">Stake</th>
+                          <th className="p-2.5">Exit Digit / Spot</th>
+                          <th className="p-2.5">Profit / Loss</th>
+                          <th className="p-2.5 text-right">Status</th>
+                        </tr>
+                      </thead>
+                      <tbody className="divide-y divide-[var(--line-soft)]">
+                        {trades.slice(0, 15).map((t) => (
+                          <tr key={t.id} className="hover:bg-[var(--surface)]/50 transition-colors">
+                            <td className="p-2.5 text-text-3 text-[11px] whitespace-nowrap">{t.time}</td>
+                            <td className="p-2.5 font-bold text-text whitespace-nowrap">{t.symbolShort}</td>
+                            <td className="p-2.5 whitespace-nowrap">
+                              <span className={`px-2 py-0.5 rounded text-[10px] font-bold ${
+                                t.type.toLowerCase().includes('over') || t.type.toLowerCase().includes('even') || t.type.toLowerCase().includes('rise')
+                                  ? 'bg-emerald-500/20 text-emerald-400'
+                                  : 'bg-rose-500/20 text-rose-400'
+                              }`}>
+                                {t.type}
+                              </span>
+                            </td>
+                            <td className="p-2.5 whitespace-nowrap">
+                              {t.contractId ? (
+                                <span className="font-mono text-xs text-accent font-semibold" title={t.longcode || ''}>
+                                  #{t.contractId}
+                                </span>
+                              ) : (
+                                <span className="text-text-3 text-xs">—</span>
+                              )}
+                            </td>
+                            <td className="p-2.5 text-text whitespace-nowrap">${t.stake.toFixed(2)}</td>
+                            <td className="p-2.5 text-text-3 whitespace-nowrap">
+                              {t.exitSpot !== undefined ? String(t.exitSpot) : '—'}
+                            </td>
+                            <td className={`p-2.5 font-bold whitespace-nowrap ${t.profit > 0 ? 'text-live' : t.profit < 0 ? 'text-fall' : 'text-text-3'}`}>
+                              {t.profit > 0 ? `+${t.profit.toFixed(2)}` : t.profit < 0 ? t.profit.toFixed(2) : '$0.00'}
+                            </td>
+                            <td className="p-2.5 text-right whitespace-nowrap">
+                              <span className={`inline-flex items-center gap-1 px-2.5 py-0.5 rounded text-[10px] font-bold uppercase ${
+                                t.status === 'won'
+                                  ? 'bg-emerald-500/20 text-emerald-400 border border-emerald-500/30'
+                                  : t.status === 'lost'
+                                  ? 'bg-rose-500/20 text-rose-400 border border-rose-500/30'
+                                  : 'bg-amber-500/20 text-amber-400 border border-amber-500/30 animate-pulse'
+                              }`}>
+                                {t.status === 'open' ? 'OPEN' : t.status.toUpperCase()}
+                              </span>
+                            </td>
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                  </div>
                 </div>
               )}
             </div>
