@@ -1198,6 +1198,13 @@ export const OVER_UNDER_STRATEGIES = [
     description: 'Waits for precision entry point (0, 1, 8, or 9) then executes rapid 2-run win',
     defaultBotName: 'Hit & run',
   },
+  {
+    id: 'over-2-recovery',
+    name: 'Deriv Auto Bot (Over 2 + Even/Odd Recovery)',
+    category: 'Deriv Strategies 2',
+    description: 'Automated 1-tick digits bot. Normal mode: waits for >= 2 digits <= 2, then digit > 2 -> buys Over 2 continuously. Loss triggers Recovery mode trading Even/Odd until win.',
+    defaultBotName: 'Deriv Auto Bot (Over 2 + Even/Odd Recovery)',
+  },
 ] as const;
 
 export type StrategyId = typeof OVER_UNDER_STRATEGIES[number]['id'];

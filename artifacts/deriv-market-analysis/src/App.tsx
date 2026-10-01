@@ -30,6 +30,7 @@ import {
   Sparkles,
   Square,
   Target,
+  Terminal,
   Trash2,
   TrendingUp,
   UserCheck,
@@ -71,6 +72,11 @@ import {
   evaluateCMVPro,
   evaluateHitAndRun,
 } from './lib/overUnderStrategies';
+import { DERIV_AUTO_BOT_PYTHON_SCRIPT } from './lib/derivAutoBotScript';
+import {
+  decideAutoBotTrade,
+  computeMartingaleStake,
+} from './lib/derivAutoBotLogic';
 
 const queryClient = new QueryClient();
 
@@ -199,9 +205,54 @@ export interface BotConfig {
   targetRuns?: number;
   takeProfit: string;
   stopLoss: string;
+  // Deriv Auto Bot properties from python implementation:
+  streak?: number;
+  maxStake?: string;
+  maxTrades?: number;
+  mode?: 'NORMAL' | 'RECOVERY';
+  entered?: boolean;
+  lossRun?: number;
+  currentStake?: number;
+  botPnl?: number;
+  botWins?: number;
+  botLosses?: number;
+  botTrades?: number;
+  lastDecision?: string;
+  isAutoBot?: boolean;
 }
 
-const INITIAL_BOTS: BotConfig[] = [];
+const INITIAL_BOTS: BotConfig[] = [
+  {
+    id: 'deriv-auto-bot-over2-recovery',
+    name: 'Deriv Auto Bot (Over 2 + Even/Odd Recovery)',
+    running: false,
+    stake: '1.00',
+    martingale: '1.0',
+    market: 'Volatility 100 Index',
+    contractType: 'Over',
+    targetDigit: 2,
+    streak: 2,
+    category: 'Deriv Strategies 2',
+    strategyId: 'over-2-recovery',
+    strategyName: 'Over 2 + Even/Odd Recovery Strategy',
+    entryRule: 'NORMAL: Wait for >= 2 digits <= 2 in a row, then digit > 2 -> Buy DIGITOVER 2. After first entry, keeps buying Over 2 continuously.',
+    recoveryRule: 'RECOVERY (after loss): Trades Even/Odd on fresh pattern (>= 2 even then odd -> DIGITODD; >= 2 odd then even -> DIGITEVEN). Returns to Over 2 upon WIN.',
+    exitRule: 'Stop when Take Profit (+$5.00) or Stop Loss (-$10.00) is reached.',
+    targetRuns: 10,
+    takeProfit: '5.00',
+    stopLoss: '10.00',
+    maxStake: '100.00',
+    mode: 'NORMAL',
+    entered: false,
+    lossRun: 0,
+    currentStake: 1.0,
+    botPnl: 0,
+    botWins: 0,
+    botLosses: 0,
+    botTrades: 0,
+    isAutoBot: true,
+  },
+];
 
 const SIGNAL_TYPES = [
   'Rise',
@@ -481,23 +532,32 @@ export function MarketMindApp() {
     targetRuns: number;
     takeProfit: string;
     stopLoss: string;
+    streak?: number;
+    maxStake?: string;
+    isAutoBot?: boolean;
   }>({
-    name: 'over 1 with over 3 recovery',
+    name: 'Deriv Auto Bot (Over 2 + Even/Odd Recovery)',
     market: 'Volatility 100 Index',
     contractType: 'Over',
-    targetDigit: 1,
-    strategyId: 'over-1',
-    strategyName: 'Over Digit 1 Strategy',
+    targetDigit: 2,
+    strategyId: 'over-2-recovery',
+    strategyName: 'Over 2 + Even/Odd Recovery Strategy',
     category: 'Deriv Strategies 2',
-    entryRule: 'Digits 0 & 1 < 10% (one red arc), 3+ digits (2-9) >= 11%, last 20 win rate >= 90%',
-    exitRule: 'Stop when hot digits disperse or target runs completed',
-    recoveryRule: 'Over 3 Recovery: trade Over 3 with 2.0x Martingale upon loss',
-    stake: '0.35',
-    martingale: '2.0',
-    targetRuns: 5,
-    takeProfit: '25.00',
+    entryRule: 'NORMAL: Wait for >= 2 digits <= 2 in a row, then digit > 2 -> Buy DIGITOVER 2. After first entry, keeps buying Over 2 continuously.',
+    recoveryRule: 'RECOVERY (after loss): Trades Even/Odd on fresh pattern (>= 2 even then odd -> DIGITODD; >= 2 odd then even -> DIGITEVEN). Returns to Over 2 upon WIN.',
+    exitRule: 'Stop when Take Profit (+$5.00) or Stop Loss (-$10.00) is reached.',
+    stake: '1.00',
+    martingale: '1.0',
+    targetRuns: 10,
+    takeProfit: '5.00',
     stopLoss: '10.00',
+    streak: 2,
+    maxStake: '100.00',
+    isAutoBot: true,
   });
+
+  const [pythonScriptModalOpen, setPythonScriptModalOpen] = useState<boolean>(false);
+  const [scriptCopied, setScriptCopied] = useState<boolean>(false);
 
   // Bots state
   const [bots, setBots] = useState<BotConfig[]>(INITIAL_BOTS);
@@ -1383,6 +1443,17 @@ export function MarketMindApp() {
       targetRuns = 4;
       entryRule = '1m TF: White bottom, Red/Green ordered (25+) -> Over 4. Candle MA rejection -> Over 6';
       recoveryRule = 'Switch to Over 3 on loss. Avoid trading if white in middle';
+    } else if (stratId === 'over-2-recovery') {
+      targetDigit = 2;
+      contractType = 'Over';
+      targetRuns = 10;
+      entryRule = 'NORMAL: Wait for >= 2 digits <= 2 in a row, then digit > 2 -> Buy DIGITOVER 2. After first entry, keeps buying Over 2 continuously.';
+      recoveryRule = 'RECOVERY (after loss): Trades Even/Odd on fresh pattern (>= 2 even then odd -> DIGITODD; >= 2 odd then even -> DIGITEVEN). Returns to Over 2 upon WIN.';
+      exitRule = 'Stop when Take Profit (+$5.00) or Stop Loss (-$10.00) is reached.';
+      stake = '1.00';
+      martingale = '1.0';
+      takeProfit = '5.00';
+      stopLoss = '10.00';
     }
 
     setEditingBot((prev) => ({
@@ -1397,7 +1468,13 @@ export function MarketMindApp() {
       entryRule,
       exitRule,
       recoveryRule,
+      stake,
       martingale,
+      takeProfit,
+      stopLoss,
+      streak: stratId === 'over-2-recovery' ? 2 : prev.streak ?? 2,
+      maxStake: stratId === 'over-2-recovery' ? '100.00' : prev.maxStake || '100.00',
+      isAutoBot: stratId === 'over-2-recovery' || prev.isAutoBot,
     }));
   };
 
@@ -1420,6 +1497,9 @@ export function MarketMindApp() {
       targetRuns: bot.targetRuns || 5,
       takeProfit: bot.takeProfit || '25.00',
       stopLoss: bot.stopLoss || '10.00',
+      streak: bot.streak ?? 2,
+      maxStake: bot.maxStake || '100.00',
+      isAutoBot: bot.isAutoBot ?? (bot.strategyId === 'over-2-recovery'),
     });
     setBotModalOpen(true);
   };
@@ -1428,21 +1508,24 @@ export function MarketMindApp() {
   const handleOpenNewBotModal = () => {
     setEditingBot({
       id: undefined,
-      name: `Active Bot (${activeMarket.displayName})`,
+      name: 'Deriv Auto Bot (Over 2 + Even/Odd Recovery)',
       market: activeMarket.displayName,
       contractType: 'Over',
-      targetDigit: 1,
-      strategyId: 'over-1',
-      strategyName: 'Over Digit 1 Strategy',
+      targetDigit: 2,
+      strategyId: 'over-2-recovery',
+      strategyName: 'Over 2 + Even/Odd Recovery Strategy',
       category: 'Deriv Strategies 2',
-      entryRule: 'Entry when signal setup conditions are met on live ticks',
-      exitRule: 'Stop when target runs completed or take-profit reached',
-      recoveryRule: 'Martingale recovery 2.0x upon loss',
-      stake: '0.35',
-      martingale: '2.0',
-      targetRuns: 5,
-      takeProfit: '25.00',
+      entryRule: 'NORMAL: Wait for >= 2 digits <= 2 in a row, then digit > 2 -> Buy DIGITOVER 2. After first entry, keeps buying Over 2 continuously.',
+      recoveryRule: 'RECOVERY (after loss): Trades Even/Odd on fresh pattern (>= 2 even then odd -> DIGITODD; >= 2 odd then even -> DIGITEVEN). Returns to Over 2 upon WIN.',
+      exitRule: 'Stop when Take Profit (+$5.00) or Stop Loss (-$10.00) is reached.',
+      stake: '1.00',
+      martingale: '1.0',
+      targetRuns: 10,
+      takeProfit: '5.00',
       stopLoss: '10.00',
+      streak: 2,
+      maxStake: '100.00',
+      isAutoBot: true,
     });
     setBotModalOpen(true);
   };
@@ -1487,11 +1570,22 @@ export function MarketMindApp() {
       entryRule: editingBot.entryRule,
       exitRule: editingBot.exitRule,
       recoveryRule: editingBot.recoveryRule,
-      stake: editingBot.stake || '0.35',
-      martingale: editingBot.martingale || '2.0',
-      targetRuns: editingBot.targetRuns || 5,
-      takeProfit: editingBot.takeProfit || '25.00',
+      stake: editingBot.stake || '1.00',
+      martingale: editingBot.martingale || '1.0',
+      targetRuns: editingBot.targetRuns || 10,
+      takeProfit: editingBot.takeProfit || '5.00',
       stopLoss: editingBot.stopLoss || '10.00',
+      streak: editingBot.streak ?? 2,
+      maxStake: editingBot.maxStake || '100.00',
+      isAutoBot: editingBot.isAutoBot ?? (editingBot.strategyId === 'over-2-recovery'),
+      mode: isExisting ? (bots.find((b) => b.id === editingBot.id)?.mode ?? 'NORMAL') : 'NORMAL',
+      entered: isExisting ? (bots.find((b) => b.id === editingBot.id)?.entered ?? false) : false,
+      lossRun: isExisting ? (bots.find((b) => b.id === editingBot.id)?.lossRun ?? 0) : 0,
+      currentStake: parseFloat(editingBot.stake) || 1.0,
+      botPnl: isExisting ? (bots.find((b) => b.id === editingBot.id)?.botPnl ?? 0) : 0,
+      botWins: isExisting ? (bots.find((b) => b.id === editingBot.id)?.botWins ?? 0) : 0,
+      botLosses: isExisting ? (bots.find((b) => b.id === editingBot.id)?.botLosses ?? 0) : 0,
+      botTrades: isExisting ? (bots.find((b) => b.id === editingBot.id)?.botTrades ?? 0) : 0,
       running: launchImmediate ? true : isExisting ? (bots.find((b) => b.id === editingBot.id)?.running ?? false) : false,
     };
 
@@ -1828,6 +1922,148 @@ export function MarketMindApp() {
     const interval = setInterval(() => {
       const activeBot = runningBots[Math.floor(Math.random() * runningBots.length)];
       const lastDigit = ticks[0]?.lastDigit ?? Math.floor(Math.random() * 10);
+
+      // Special execution path for Deriv Auto Bot (Over 2 + Even/Odd Recovery)
+      if (activeBot.isAutoBot || activeBot.strategyId === 'over-2-recovery') {
+        const recentDigits = ticks.slice(0, 35).map((t) => t.lastDigit).reverse();
+        const mode = activeBot.mode || 'NORMAL';
+        const entered = Boolean(activeBot.entered);
+        const barrier = activeBot.targetDigit ?? 2;
+        const streak = activeBot.streak ?? 2;
+
+        const decision = decideAutoBotTrade(recentDigits, mode, entered, barrier, streak);
+
+        if (!decision) {
+          // Waiting for setup condition
+          setBots((prev) =>
+            prev.map((b) =>
+              b.id === activeBot.id
+                ? {
+                    ...b,
+                    lastDecision:
+                      mode === 'NORMAL'
+                        ? `[NORMAL] Waiting for >= ${streak} digits <= ${barrier} then digit > ${barrier}...`
+                        : `[RECOVERY] Waiting for >= ${streak} alternating parity pattern...`,
+                  }
+                : b
+            )
+          );
+          return;
+        }
+
+        // Setup condition satisfied or continuous cycle active!
+        const baseStake = parseFloat(activeBot.stake) || 1.0;
+        const martingale = parseFloat(activeBot.martingale) || 1.0;
+        const lossRun = activeBot.lossRun || 0;
+        const maxStake = parseFloat(activeBot.maxStake || '100.0') || 100.0;
+        const tradeStake = computeMartingaleStake(baseStake, martingale, lossRun, maxStake);
+
+        let won = false;
+        let payoutRate = 0.95;
+
+        if (decision.contractType === 'Over') {
+          won = lastDigit > (decision.barrier ?? barrier);
+          payoutRate = (decision.barrier ?? barrier) === 1 ? 0.22 : (decision.barrier ?? barrier) === 2 ? 0.38 : 0.58;
+        } else if (decision.contractType === 'Under') {
+          won = lastDigit < (decision.barrier ?? barrier);
+          payoutRate = 0.38;
+        } else if (decision.contractType === 'Even') {
+          won = lastDigit % 2 === 0;
+          payoutRate = 0.95;
+        } else if (decision.contractType === 'Odd') {
+          won = lastDigit % 2 !== 0;
+          payoutRate = 0.95;
+        }
+
+        const profitDelta = won ? Number((tradeStake * payoutRate).toFixed(2)) : -tradeStake;
+
+        // Transition modes per Python strategy:
+        // NORMAL -> on loss -> RECOVERY
+        // RECOVERY -> on win -> NORMAL
+        let nextMode = mode;
+        let nextLossRun = lossRun;
+        let nextEntered = entered;
+
+        if (decision.contractType === 'Over') {
+          nextEntered = true;
+        }
+
+        if (won) {
+          nextLossRun = 0;
+          if (mode === 'RECOVERY') {
+            nextMode = 'NORMAL';
+            nextEntered = true;
+          }
+        } else {
+          nextLossRun = lossRun + 1;
+          if (mode === 'NORMAL') {
+            nextMode = 'RECOVERY';
+          }
+        }
+
+        const newBotPnl = Number(((activeBot.botPnl || 0) + profitDelta).toFixed(2));
+        const tpVal = parseFloat(activeBot.takeProfit) || 5.0;
+        const slVal = parseFloat(activeBot.stopLoss) || 10.0;
+
+        let shouldStop = false;
+        let stopReason = '';
+        if (newBotPnl >= tpVal) {
+          shouldStop = true;
+          stopReason = `Take profit reached (+${newBotPnl.toFixed(2)})`;
+        } else if (newBotPnl <= -slVal) {
+          shouldStop = true;
+          stopReason = `Stop loss reached (${newBotPnl.toFixed(2)})`;
+        }
+
+        setBots((prev) =>
+          prev.map((b) =>
+            b.id === activeBot.id
+              ? {
+                  ...b,
+                  mode: nextMode,
+                  lossRun: nextLossRun,
+                  entered: nextEntered,
+                  botPnl: newBotPnl,
+                  botWins: (b.botWins || 0) + (won ? 1 : 0),
+                  botLosses: (b.botLosses || 0) + (won ? 0 : 1),
+                  botTrades: (b.botTrades || 0) + 1,
+                  currentStake: tradeStake,
+                  running: shouldStop ? false : b.running,
+                  lastDecision: `${decision.reason} -> ${won ? 'WIN' : 'LOSS'} (${profitDelta > 0 ? '+' : ''}${profitDelta.toFixed(2)})`,
+                }
+              : b
+          )
+        );
+
+        if (shouldStop) {
+          setBotRunToast(`${activeBot.name}: ${stopReason}!`);
+        }
+
+        // Update balances
+        if (!isRealAccount) {
+          setDemoBalance((prev) => Number((prev + profitDelta).toFixed(2)));
+        }
+        setTodayProfit((prev) => Number((prev + profitDelta).toFixed(2)));
+
+        if (won) setTodayWins((w) => w + 1);
+        else setTodayLosses((l) => l + 1);
+
+        const newTrade: ActiveTrade = {
+          id: String(Date.now()),
+          type: decision.barrier !== undefined ? `${decision.contractType} ${decision.barrier} [${mode}]` : `${decision.contractType} [${mode}]`,
+          symbol: activeBot.market,
+          symbolShort: activeBot.market.includes('100') ? 'V100' : activeBot.market.includes('75') ? 'V75' : activeBot.market.includes('50') ? 'V50' : 'V25',
+          stake: tradeStake,
+          status: won ? 'won' : 'lost',
+          profit: profitDelta,
+          time: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' }),
+        };
+
+        setTrades((prev) => [newTrade, ...prev.slice(0, 7)]);
+        return;
+      }
+
+      // Standard / other bots execution
       const stakeNum = parseFloat(activeBot.stake) || 0.35;
       const targetDig = activeBot.targetDigit ?? (activeBot.contractType === 'Under' ? 7 : 2);
 
@@ -1884,7 +2120,7 @@ export function MarketMindApp() {
       };
 
       setTrades((prev) => [newTrade, ...prev.slice(0, 7)]);
-    }, 6000);
+    }, 4500);
 
     return () => clearInterval(interval);
   }, [bots, ticks, isRealAccount, runsStepper]);
@@ -3531,6 +3767,15 @@ export function MarketMindApp() {
                     {bots.filter((b) => !b.running).length} idle
                   </span>
                   <button
+                    className="btn btn-secondary text-xs flex items-center gap-1.5"
+                    type="button"
+                    onClick={() => setPythonScriptModalOpen(true)}
+                    title="View & export standalone Python trading bot for VPS/PC"
+                  >
+                    <Terminal size={14} className="text-accent" />
+                    Python Script
+                  </button>
+                  <button
                     className="btn btn-primary"
                     type="button"
                     onClick={handleOpenNewBotModal}
@@ -3643,6 +3888,22 @@ export function MarketMindApp() {
                                 {bot.category}
                               </span>
                             )}
+                            {(bot.isAutoBot || bot.strategyId === 'over-2-recovery') && (
+                              <span
+                                className={`bot-tag font-bold ${
+                                  bot.mode === 'RECOVERY'
+                                    ? 'bg-amber-500/20 text-amber-400 border border-amber-500/40 animate-pulse'
+                                    : 'bg-emerald-500/20 text-emerald-400 border border-emerald-500/40'
+                                }`}
+                              >
+                                Mode: {bot.mode || 'NORMAL'} {bot.mode === 'RECOVERY' ? '(Even/Odd)' : `(Over ${bot.targetDigit ?? 2})`}
+                              </span>
+                            )}
+                            {bot.streak !== undefined && (
+                              <span className="bot-tag bg-blue-500/20 text-blue-300 border border-blue-500/30">
+                                Streak: {bot.streak}
+                              </span>
+                            )}
                             {(isOver || isUnder) && (
                               <span className={`bot-tag ${isOver ? 'bot-tag-over' : 'bot-tag-under'}`}>
                                 {isOver ? '↑' : '↓'} Target: {bot.contractType.toUpperCase()} {targetDig}
@@ -3654,6 +3915,44 @@ export function MarketMindApp() {
                               </span>
                             )}
                           </div>
+
+                          {/* Live Performance & Stats Strip */}
+                          {((bot.botTrades || 0) > 0 || bot.running || bot.isAutoBot) && (
+                            <div className="p-2.5 rounded-lg bg-[var(--surface-2)]/90 border border-[var(--line-soft)] grid grid-cols-4 gap-1 text-center font-mono text-xs my-2">
+                              <div>
+                                <div className="text-[10px] text-text-3 uppercase tracking-wider">Session P/L</div>
+                                <div className={`font-bold ${(bot.botPnl || 0) >= 0 ? 'text-live' : 'text-fall'}`}>
+                                  {(bot.botPnl || 0) >= 0 ? '+' : ''}{(bot.botPnl || 0).toFixed(2)}
+                                </div>
+                              </div>
+                              <div>
+                                <div className="text-[10px] text-text-3 uppercase tracking-wider">Win / Loss</div>
+                                <div className="text-text font-semibold">
+                                  {bot.botWins || 0}W · {bot.botLosses || 0}L
+                                </div>
+                              </div>
+                              <div>
+                                <div className="text-[10px] text-text-3 uppercase tracking-wider">Loss Run</div>
+                                <div className={`font-semibold ${(bot.lossRun || 0) > 0 ? 'text-amber-400' : 'text-text-3'}`}>
+                                  {bot.lossRun || 0}
+                                </div>
+                              </div>
+                              <div>
+                                <div className="text-[10px] text-text-3 uppercase tracking-wider">Stake</div>
+                                <div className="text-accent font-semibold">
+                                  ${(bot.currentStake || parseFloat(bot.stake) || 1).toFixed(2)}
+                                </div>
+                              </div>
+                            </div>
+                          )}
+
+                          {/* Live Decision Tracker */}
+                          {bot.lastDecision && bot.running && (
+                            <div className="mb-2 px-2.5 py-1 rounded bg-black/40 border border-accent/20 text-[11px] font-mono text-accent flex items-center gap-1.5">
+                              <span className="inline-block w-1.5 h-1.5 rounded-full bg-accent animate-ping" />
+                              <span className="truncate">{bot.lastDecision}</span>
+                            </div>
+                          )}
 
                           {/* Strategy Rules Preview */}
                           {(bot.entryRule || bot.recoveryRule) && (
@@ -3761,6 +4060,38 @@ export function MarketMindApp() {
                               </label>
                             )}
 
+                            {(bot.isAutoBot || bot.strategyId === 'over-2-recovery') && (
+                              <>
+                                <label>
+                                  Trigger Streak
+                                  <input
+                                    type="number"
+                                    min="1"
+                                    max="10"
+                                    className="mmp-input"
+                                    value={bot.streak ?? 2}
+                                    onChange={(e) => {
+                                      const val = Math.max(1, parseInt(e.target.value, 10) || 1);
+                                      setBots((prev) => prev.map((b) => (b.id === bot.id ? { ...b, streak: val } : b)));
+                                    }}
+                                  />
+                                </label>
+                                <label>
+                                  Max Stake ($)
+                                  <input
+                                    type="text"
+                                    className="mmp-input"
+                                    value={bot.maxStake || '100.00'}
+                                    onChange={(e) => {
+                                      const val = e.target.value;
+                                      setBots((prev) => prev.map((b) => (b.id === bot.id ? { ...b, maxStake: val } : b)));
+                                    }}
+                                    inputMode="decimal"
+                                  />
+                                </label>
+                              </>
+                            )}
+
                             <label>
                               Target Runs
                               <input
@@ -3822,6 +4153,16 @@ export function MarketMindApp() {
                             >
                               <Settings size={14} />
                             </button>
+                            {(bot.isAutoBot || bot.strategyId === 'over-2-recovery') && (
+                              <button
+                                className="btn-bot-sub text-accent hover:text-accent font-mono text-xs flex items-center gap-1"
+                                type="button"
+                                onClick={() => setPythonScriptModalOpen(true)}
+                                title="View & Copy Standalone Python Script for VPS/PC"
+                              >
+                                <Terminal size={14} />
+                              </button>
+                            )}
                             {bot.strategyId && (
                               <button
                                 className="btn-bot-sub"
@@ -4040,6 +4381,7 @@ export function MarketMindApp() {
               >
                 <option value="" disabled>Select strategy template to load rules...</option>
                 <optgroup label="Deriv Strategies 2 (Over/Under)">
+                  <option value="over-2-recovery">Deriv Auto Bot (Over 2 + Even/Odd Recovery)</option>
                   <option value="over-1">Over 1 Strategy (Over 3 Recovery, 90% WR)</option>
                   <option value="over-2">Over 2 Strategy (Over 4 Recovery, 78% WR)</option>
                   <option value="under-8">Under 8 Strategy (Under 6 Recovery, 90% WR)</option>
@@ -4192,6 +4534,33 @@ export function MarketMindApp() {
                   className="mmp-input"
                   value={editingBot.stopLoss}
                   onChange={(e) => setEditingBot({ ...editingBot, stopLoss: e.target.value })}
+                  inputMode="decimal"
+                />
+              </div>
+            </div>
+
+            <div className="grid grid-cols-1 sm:grid-cols-2 gap-3 mb-3">
+              <div>
+                <label className="modal-label">Trigger Streak (Digits in a row)</label>
+                <input
+                  type="number"
+                  min="1"
+                  max="10"
+                  className="mmp-input"
+                  value={editingBot.streak ?? 2}
+                  onChange={(e) =>
+                    setEditingBot({ ...editingBot, streak: Math.max(1, parseInt(e.target.value, 10) || 1) })
+                  }
+                />
+              </div>
+
+              <div>
+                <label className="modal-label">Max Stake Cap ($)</label>
+                <input
+                  type="text"
+                  className="mmp-input"
+                  value={editingBot.maxStake || '100.00'}
+                  onChange={(e) => setEditingBot({ ...editingBot, maxStake: e.target.value })}
                   inputMode="decimal"
                 />
               </div>
