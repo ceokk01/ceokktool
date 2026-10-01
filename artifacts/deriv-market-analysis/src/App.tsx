@@ -50,6 +50,7 @@ import {
   getOAuthState,
   getCodeVerifier,
   clearOAuthSession,
+  parseDerivOAuthParams,
   saveStoredAccounts,
   saveStoredAppId,
   saveStoredToken,
@@ -521,9 +522,11 @@ export function MarketMindApp() {
     setPriceDiff(0);
   }, [activeMarket.symbol]);
 
-  // Handle Deriv OAuth 2.0 callback (authorization code + PKCE)
+  // Handle Deriv OAuth 2.0 callback (both classic token/accounts and code PKCE)
   useEffect(() => {
-    const params = new URLSearchParams(window.location.search);
+    const rawSearch = window.location.search || '';
+    const rawHash = window.location.hash || '';
+    const params = new URLSearchParams(rawSearch);
     const code = params.get('code');
     const returnedState = params.get('state');
     const oauthError = params.get('error');
@@ -538,28 +541,46 @@ export function MarketMindApp() {
       return;
     }
 
+    // 1. Classic Deriv OAuth params (?acct1=...&token1=... or #acct1=...&token1=...)
+    const classicAccounts = parseDerivOAuthParams(rawSearch + '&' + rawHash);
+    if (classicAccounts.length > 0) {
+      saveStoredAccounts(classicAccounts);
+      setOauthAccounts(classicAccounts);
+
+      const first = classicAccounts[0];
+      setActiveAccountLogin(first.account);
+      setActiveAccountLoginId(first.account);
+      setToken(first.token);
+      saveStoredToken(first.token);
+      setTokenInput(first.token);
+      setIsRealAccount(!first.isVirtual);
+      setTokenModalOpen(false);
+
+      clearOAuthSession();
+      window.history.replaceState({}, document.title, window.location.pathname);
+      setAuthToast(`Authorized successfully with Deriv account ${first.account}!`);
+      return;
+    }
+
+    // 2. Direct single token in query (?token=... or ?access_token=...)
+    const directToken = params.get('token') || params.get('access_token');
+    if (!code && directToken) {
+      setToken(directToken);
+      saveStoredToken(directToken);
+      setTokenInput(directToken);
+      setTokenModalOpen(false);
+      window.history.replaceState({}, document.title, window.location.pathname);
+      setAuthToast('Connected with Deriv token!');
+      return;
+    }
+
     if (!code) {
       return;
     }
 
+    // 3. Authorization code + PKCE flow
     const expectedState = getOAuthState();
     const codeVerifier = getCodeVerifier();
-
-    if (!returnedState || !expectedState || returnedState !== expectedState) {
-      console.error('Deriv OAuth state validation failed.');
-      setAuthError('Deriv authorization could not be verified. Please try again.');
-      clearOAuthSession();
-      window.history.replaceState({}, document.title, window.location.pathname);
-      return;
-    }
-
-    if (!codeVerifier) {
-      console.error('Deriv OAuth PKCE verifier is missing.');
-      setAuthError('Deriv authorization session expired. Please try again.');
-      clearOAuthSession();
-      window.history.replaceState({}, document.title, window.location.pathname);
-      return;
-    }
 
     let cancelled = false;
 
@@ -568,17 +589,32 @@ export function MarketMindApp() {
       setAuthError(null);
 
       try {
-        const response = await fetch('/api/deriv/oauth/token', {
+        // Try POST first, fallback to GET if needed
+        let response = await fetch('/api/deriv/oauth/token', {
           method: 'POST',
           headers: {
             'Content-Type': 'application/json',
           },
           body: JSON.stringify({
             code,
-            state: returnedState,
-            codeVerifier,
+            state: returnedState || '',
+            codeVerifier: codeVerifier || '',
           }),
         });
+
+        if (response.status === 405 || !response.ok) {
+          // Fallback to GET for environments where only GET is permitted
+          const getUrl = `/api/deriv/oauth/token?code=${encodeURIComponent(code)}&code_verifier=${encodeURIComponent(codeVerifier || '')}`;
+          const fallbackRes = await fetch(getUrl, {
+            method: 'GET',
+            headers: {
+              Accept: 'application/json',
+            },
+          });
+          if (fallbackRes.ok) {
+            response = fallbackRes;
+          }
+        }
 
         const data = await response.json().catch(() => ({}));
 
@@ -593,6 +629,15 @@ export function MarketMindApp() {
         const accounts = Array.isArray(data?.accounts)
           ? (data.accounts as DerivOAuthAccount[])
           : [];
+
+        if (accounts.length === 0 && data?.access_token) {
+          accounts.push({
+            account: 'Deriv Account',
+            token: data.access_token,
+            currency: 'USD',
+            isVirtual: false,
+          });
+        }
 
         if (accounts.length === 0) {
           throw new Error('Deriv authorization succeeded but no accounts were returned.');

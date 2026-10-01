@@ -412,6 +412,207 @@ function apiPlugin(): Plugin {
       res.end(JSON.stringify({ symbols }));
       return;
     }
+
+    if (pathname === '/api/deriv/oauth/token') {
+      res.setHeader('Access-Control-Allow-Origin', '*');
+      res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
+      res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
+
+      if (req.method === 'OPTIONS') {
+        res.statusCode = 200;
+        res.end();
+        return;
+      }
+
+      const isPost = req.method === 'POST';
+      let body: any = {};
+      if (isPost) {
+        try {
+          const chunks: any[] = [];
+          for await (const chunk of req) {
+            chunks.push(chunk);
+          }
+          const raw = Buffer.concat(chunks).toString();
+          body = raw ? JSON.parse(raw) : {};
+        } catch {
+          body = {};
+        }
+      }
+
+      const query = Object.fromEntries(parsedUrl.searchParams.entries());
+      const code = (body.code || query.code) as string | undefined;
+      const codeVerifier = (body.codeVerifier || body.code_verifier || query.code_verifier || query.codeVerifier || '') as string;
+      const clientId = (body.clientId || body.client_id || query.client_id || query.clientId || DERIV_CLIENT_ID) as string;
+      const redirectUri = (body.redirectUri || body.redirect_uri || query.redirect_uri || query.redirectUri || computeRedirectUri(req)) as string;
+      const directToken = (body.token || body.accessToken || query.token || query.access_token || (req.headers.authorization ? req.headers.authorization.replace(/^bearer\s+/i, '') : '')) as string;
+
+      // 1. Classic Deriv query params (?acct1=...&token1=...)
+      const classicAccounts: any[] = [];
+      let i = 1;
+      while (query[`acct${i}`] && query[`token${i}`]) {
+        const account = String(query[`acct${i}`] || '').trim();
+        const token = String(query[`token${i}`] || '').trim();
+        const currency = String(query[`cur${i}`] || 'USD').trim();
+        const isVirtual = account.startsWith('VR') || account.toLowerCase().includes('virtual');
+        if (account && token) {
+          classicAccounts.push({
+            account,
+            token,
+            currency,
+            isVirtual,
+            balance: 0,
+            accountType: isVirtual ? 'demo' : 'real',
+          });
+        }
+        i++;
+      }
+
+      if (classicAccounts.length > 0) {
+        if (req.headers.accept?.includes('text/html')) {
+          res.writeHead(302, { Location: `/?${parsedUrl.searchParams.toString()}` });
+          res.end();
+          return;
+        }
+        res.setHeader('Content-Type', 'application/json');
+        res.end(JSON.stringify({ accounts: classicAccounts }));
+        return;
+      }
+
+      // 2. Direct token verification
+      if (!code && directToken) {
+        try {
+          const response = await fetch('https://api.derivws.com/trading/v1/options/accounts', {
+            headers: {
+              Authorization: `Bearer ${directToken}`,
+              'Deriv-App-ID': clientId,
+            },
+          });
+          const data = await response.json().catch(() => ({}));
+          const rawAccounts = (data?.data || data?.accounts || []) as any[];
+          const accounts = rawAccounts.map((a) => {
+            const id = String(a.account_id || a.loginid || a.login_id || a.id || '');
+            const type = String(a.account_type || '').toLowerCase();
+            const isVirtual = type === 'demo' || Boolean(a.is_virtual) || id.startsWith('VR');
+            return {
+              account: id,
+              token: directToken,
+              currency: String(a.currency || a.currency_code || 'USD'),
+              accountType: type || (isVirtual ? 'demo' : 'real'),
+              isVirtual,
+              balance: Number(a.balance ?? 0),
+            };
+          }).filter((a) => a.account);
+
+          res.setHeader('Content-Type', 'application/json');
+          res.end(JSON.stringify({ accounts }));
+          return;
+        } catch (e: any) {
+          res.statusCode = 500;
+          res.setHeader('Content-Type', 'application/json');
+          res.end(JSON.stringify({ error: 'accounts_fetch_failed', error_description: e.message }));
+          return;
+        }
+      }
+
+      // 3. Authorization code exchange
+      if (code) {
+        try {
+          const tokenResponse = await fetch('https://auth.deriv.com/oauth2/token', {
+            method: 'POST',
+            headers: {
+              'Content-Type': 'application/x-www-form-urlencoded',
+            },
+            body: new URLSearchParams({
+              grant_type: 'authorization_code',
+              client_id: clientId,
+              code: String(code),
+              code_verifier: codeVerifier,
+              redirect_uri: redirectUri,
+            }),
+          });
+
+          const tokenData = await tokenResponse.json().catch(() => ({}));
+          if (!tokenResponse.ok || !tokenData.access_token) {
+            res.statusCode = tokenResponse.status || 400;
+            res.setHeader('Content-Type', 'application/json');
+            res.end(JSON.stringify({
+              error: tokenData.error || 'token_exchange_failed',
+              error_description: tokenData.error_description || tokenData.message || 'Deriv OAuth token exchange failed.',
+            }));
+            return;
+          }
+
+          let accounts: any[] = [];
+          try {
+            const acctRes = await fetch('https://api.derivws.com/trading/v1/options/accounts', {
+              headers: {
+                Authorization: `Bearer ${tokenData.access_token}`,
+                'Deriv-App-ID': clientId,
+              },
+            });
+            const acctData = await acctRes.json().catch(() => ({}));
+            const rawAccounts = (acctData?.data || acctData?.accounts || []) as any[];
+            accounts = rawAccounts.map((a) => {
+              const id = String(a.account_id || a.loginid || a.login_id || a.id || '');
+              const type = String(a.account_type || '').toLowerCase();
+              const isVirtual = type === 'demo' || Boolean(a.is_virtual) || id.startsWith('VR');
+              return {
+                account: id,
+                token: tokenData.access_token,
+                currency: String(a.currency || a.currency_code || 'USD'),
+                accountType: type || (isVirtual ? 'demo' : 'real'),
+                isVirtual,
+                balance: Number(a.balance ?? 0),
+              };
+            }).filter((a) => a.account);
+          } catch {
+            // fallback
+          }
+
+          if (accounts.length === 0) {
+            accounts = [
+              {
+                account: 'Deriv Account',
+                token: tokenData.access_token,
+                currency: 'USD',
+                accountType: 'real',
+                isVirtual: false,
+                balance: 0,
+              },
+            ];
+          }
+
+          if (req.headers.accept?.includes('text/html')) {
+            res.writeHead(302, { Location: `/?token=${encodeURIComponent(tokenData.access_token)}&auth=success` });
+            res.end();
+            return;
+          }
+
+          res.setHeader('Content-Type', 'application/json');
+          res.end(JSON.stringify({
+            access_token: tokenData.access_token,
+            accounts,
+          }));
+          return;
+        } catch (err: any) {
+          res.statusCode = 500;
+          res.setHeader('Content-Type', 'application/json');
+          res.end(JSON.stringify({
+            error: 'server_error',
+            error_description: err?.message || 'Token exchange failed',
+          }));
+          return;
+        }
+      }
+
+      res.statusCode = 400;
+      res.setHeader('Content-Type', 'application/json');
+      res.end(JSON.stringify({
+        error: 'invalid_request',
+        error_description: 'Missing authorization code or token.',
+      }));
+      return;
+    }
     next();
   };
 
